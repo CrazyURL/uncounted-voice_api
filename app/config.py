@@ -1,0 +1,103 @@
+import os
+from pathlib import Path
+
+# Environment
+ENV = os.environ.get("ENV", "dev")
+PORT = int(os.environ.get("PORT", "8001" if ENV == "dev" else "8000"))
+HOST = os.environ.get("HOST", "0.0.0.0")
+WORKERS = int(os.environ.get("WORKERS", "1"))
+
+# WhisperX 모델 설정
+MODEL_SIZE = os.environ.get("MODEL_SIZE", "large-v3")
+DEVICE = os.environ.get("DEVICE", "cuda")
+COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "float16")
+LANGUAGE = os.environ.get("LANGUAGE", "ko")
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "2"))
+
+# HuggingFace 토큰 (화자분리용)
+HF_TOKEN = os.environ.get("HF_TOKEN", None)
+
+# 파일 경로 (RAM 디스크)
+TEMP_DIR = Path(os.environ.get("TEMP_DIR", "/dev/shm/stt-temp"))
+RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", "/dev/shm/stt-results"))
+
+# 업로드 제한
+MAX_UPLOAD_SIZE = int(os.environ.get("MAX_UPLOAD_SIZE", str(500 * 1024 * 1024)))
+ALLOWED_EXTENSIONS = {"wav", "mp3", "m4a", "ogg", "flac", "webm", "mp4"}
+
+# 발화 분리 (Utterance Segmentation)
+SILENCE_GAP_SEC = float(os.environ.get("SILENCE_GAP_SEC", "0.5"))
+MIN_UTTERANCE_SEC = float(os.environ.get("MIN_UTTERANCE_SEC", "5.0"))
+MAX_UTTERANCE_SEC = float(os.environ.get("MAX_UTTERANCE_SEC", "30.0"))
+SHORT_ANSWER_MIN_SEC = float(os.environ.get("SHORT_ANSWER_MIN_SEC", "0.3"))
+PADDING_SEC = float(os.environ.get("PADDING_SEC", "0.15"))
+
+# 로깅
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "DEBUG" if ENV == "dev" else "INFO")
+
+# 서버 정보
+VERSION = "2.0.0"
+SERVICE_NAME = "WhisperX STT Server"
+
+# 발화 분리 상수 (UtteranceSegmenter)
+SILENCE_GAP_SEC = 0.5
+MIN_UTTERANCE_SEC = 5.0
+MAX_UTTERANCE_SEC = 30.0
+SHORT_ANSWER_MIN_SEC = 0.3
+PADDING_SEC = 0.15
+SHORT_ANSWER_WORDS = [
+    # 긍정 응답
+    "네", "넵", "넹",
+    "예", "옙",
+    "응", "응응", "엉",
+    # 부정 응답
+    "아니", "아니요", "아뇨", "아니야", "아니에요",
+    # 동의/인정
+    "그래", "그래요", "그럼", "그럼요", "그렇죠", "그렇지",
+    "맞아", "맞아요", "맞네", "맞죠",
+    "좋아", "좋아요", "좋죠",
+    "알겠어", "알겠어요", "알았어", "알았어요",
+    "오케이", "오케", "OK",
+    # 망설임 (선별적)
+    "음", "흠",
+]
+SAMPLE_RATE = 16000
+
+# Audio Preprocessing — 보수적 임계값 (품질 보존 우선)
+SILENCE_RMS_THRESHOLD = float(os.environ.get("SILENCE_RMS_THRESHOLD", "0.005"))
+DUPLICATE_WINDOW_SEC = float(os.environ.get("DUPLICATE_WINDOW_SEC", "2.5"))
+DUPLICATE_CORR_THRESHOLD = float(os.environ.get("DUPLICATE_CORR_THRESHOLD", "0.95"))
+PREPROCESS_FRAME_MS = int(os.environ.get("PREPROCESS_FRAME_MS", "20"))
+
+# 무음 압축 전용 임계값 (SILENCE_GAP_SEC 발화분리용과 분리)
+SILENCE_COMPRESS_MIN_SEC = float(os.environ.get("SILENCE_COMPRESS_MIN_SEC", "1.0"))
+SILENCE_COMPRESS_TARGET_SEC = float(os.environ.get("SILENCE_COMPRESS_TARGET_SEC", "0.5"))
+
+# Gain Normalize 최대 증폭 (노이즈 증폭 방지)
+MAX_GAIN_X = float(os.environ.get("MAX_GAIN_X", "10.0"))
+
+# STT 힌트 (고유명사 인식 개선)
+HOTWORDS = os.environ.get("HOTWORDS", None)
+INITIAL_PROMPT = os.environ.get("INITIAL_PROMPT", None)
+
+# ─────────────────────────────────────────────────────────────
+# 전처리 파이프라인 단계별 토글 (품질 보존 점진 활성화)
+# Round 1: gain만 ON → Round 2: + silence → Round 3: + denoise → Round 4: + dedup
+# ─────────────────────────────────────────────────────────────
+PREPROCESS_GAIN_ENABLED = os.environ.get("PREPROCESS_GAIN_ENABLED", "true").lower() in ("true", "1", "yes")
+PREPROCESS_DENOISE_ENABLED = os.environ.get("PREPROCESS_DENOISE_ENABLED", "false").lower() in ("true", "1", "yes")
+PREPROCESS_DEDUP_ENABLED = os.environ.get("PREPROCESS_DEDUP_ENABLED", "false").lower() in ("true", "1", "yes")
+PREPROCESS_SILENCE_ENABLED = os.environ.get("PREPROCESS_SILENCE_ENABLED", "false").lower() in ("true", "1", "yes")
+
+# 레거시 호환 (deprecated — 제거 예정)
+DENOISE_ENABLED = PREPROCESS_DENOISE_ENABLED
+
+# Deduplication: 슬라이딩 윈도우 최대 룩어헤드 (5 → 3, 오탐 감소)
+MAX_DEDUP_LOOKAHEAD = int(os.environ.get("MAX_DEDUP_LOOKAHEAD", "3"))
+
+# 대용량 오디오 청크 분할
+CHUNK_DURATION_SEC = int(os.environ.get("CHUNK_DURATION_SEC", "1800"))    # 목표 청크 길이 (30분)
+CHUNK_THRESHOLD_SEC = int(os.environ.get("CHUNK_THRESHOLD_SEC", "3600"))  # 이 길이 이상만 분할 (1시간)
+CHUNK_SILENCE_DB = float(os.environ.get("CHUNK_SILENCE_DB", "-30"))       # 무음 감지 임계값 (dB)
+CHUNK_SILENCE_DUR = float(os.environ.get("CHUNK_SILENCE_DUR", "0.3"))     # 최소 무음 길이 (초)
+CHUNK_MARGIN_SEC = int(os.environ.get("CHUNK_MARGIN_SEC", "300"))         # 분할 지점 탐색 범위 (±5분)

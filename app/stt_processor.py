@@ -1,0 +1,662 @@
+import logging
+import re
+import subprocess
+import threading
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import whisperx
+from whisperx.diarize import DiarizationPipeline
+
+from app import config
+from app.pii_masker import mask_pii, mask_segments
+from app.services.audio_preprocessor import load_df_model, preprocess
+from app.services.utterance_segmenter import segment as segment_utterances
+from app.services.audio_splitter import (
+    extract_utterance_audio,
+    mute_non_speaker,
+    to_wav_bytes,
+)
+from app.services.chunk_utterance_emitter import emit_chunk_utterances
+
+logger = logging.getLogger(__name__)
+
+# 전역 모델 (앱 시작 시 1회 로딩)
+_model = None
+_align_model = None
+_align_metadata = None
+_diarize_model = None
+_gpu_lock = threading.Semaphore(1)  # GPU 동시 1건만 추론
+
+
+# ---------------------------------------------------------------------------
+# 대용량 오디오 청크 분할 헬퍼
+# ---------------------------------------------------------------------------
+
+def _get_audio_duration(file_path: Path) -> float:
+    """ffprobe로 오디오 길이를 초 단위로 반환한다. 메모리 사용 없음."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    return float(result.stdout.strip())
+
+
+def _detect_silence_points(file_path: Path) -> list[float]:
+    """ffmpeg silencedetect로 무음 구간의 중간 지점 목록을 반환한다. 스트리밍 방식."""
+    result = subprocess.run(
+        ["ffmpeg", "-i", str(file_path),
+         "-af", f"silencedetect=noise={config.CHUNK_SILENCE_DB}dB:d={config.CHUNK_SILENCE_DUR}",
+         "-f", "null", "-"],
+        capture_output=True, text=True, timeout=600,
+    )
+    # stderr에서 silence_start/silence_end 파싱
+    starts = [float(m.group(1)) for m in re.finditer(r"silence_start:\s*([\d.]+)", result.stderr)]
+    ends = [float(m.group(1)) for m in re.finditer(r"silence_end:\s*([\d.]+)", result.stderr)]
+    # 각 무음 구간의 중간 지점 반환
+    points = []
+    for s, e in zip(starts, ends):
+        points.append((s + e) / 2)
+    return points
+
+
+def _find_split_points(
+    silence_points: list[float],
+    total_duration: float,
+    target_chunk: int,
+    margin: int,
+) -> list[float]:
+    """목표 청크 길이 근처의 무음 지점에서 분할 지점을 결정한다."""
+    split_points = []
+    current_start = 0.0
+
+    while current_start + target_chunk < total_duration:
+        target = current_start + target_chunk
+        lo = target - margin
+        hi = target + margin
+
+        # 범위 내 무음 지점 중 목표에 가장 가까운 것 선택
+        candidates = [p for p in silence_points if lo <= p <= hi]
+        if candidates:
+            best = min(candidates, key=lambda p: abs(p - target))
+        else:
+            best = target  # 무음 없으면 고정 분할 (폴백)
+
+        split_points.append(best)
+        current_start = best
+
+    return split_points
+
+
+def _extract_chunk(file_path: Path, start: float, end: float, output_path: Path) -> None:
+    """ffmpeg로 특정 구간을 16kHz mono WAV로 추출한다."""
+    duration = end - start
+    subprocess.run(
+        ["ffmpeg", "-y", "-ss", str(start), "-i", str(file_path),
+         "-t", str(duration), "-ar", "16000", "-ac", "1",
+         "-f", "wav", str(output_path)],
+        capture_output=True, timeout=300,
+    )
+
+
+def _compute_audio_stats(
+    audio: np.ndarray | None,
+    sr: int,
+    segments: list[dict],
+    total_duration: float,
+    file_size_bytes: int = 0,
+) -> dict:
+    """오디오 통계를 계산한다. audio가 None(청크 모드)이면 segments 기반으로 추정."""
+    # segments에서 발화 시간 합산
+    speech_seconds = sum(
+        seg.get("end", 0) - seg.get("start", 0)
+        for seg in segments
+        if seg.get("end", 0) > seg.get("start", 0)
+    )
+    silence_ratio = max(0.0, 1.0 - speech_seconds / total_duration) if total_duration > 0 else 0.0
+    effective_minutes = round(speech_seconds / 60, 2)
+
+    stats: dict = {
+        "sample_rate": sr,
+        "channels": 1,
+        "bitrate": round(file_size_bytes * 8 / total_duration / 1000, 1) if total_duration > 0 and file_size_bytes > 0 else 0,
+        "silence_ratio": round(silence_ratio, 3),
+        "effective_minutes": effective_minutes,
+    }
+
+    if audio is not None and len(audio) > 0:
+        # PCM 기반 정밀 분석
+        rms = float(np.sqrt(np.mean(audio ** 2)))
+        stats["rms"] = round(rms, 4)
+
+        # clipping: |sample| > 0.99 비율
+        clipping_ratio = float(np.mean(np.abs(audio) > 0.99))
+        stats["clipping_ratio"] = round(clipping_ratio, 5)
+
+        # SNR 추정: 프레임별 RMS로 signal vs noise 추정
+        frame_len = sr // 10  # 100ms 프레임
+        n_frames = len(audio) // frame_len
+        if n_frames > 1:
+            frames = audio[:n_frames * frame_len].reshape(n_frames, frame_len)
+            frame_rms = np.sqrt(np.mean(frames ** 2, axis=1))
+            sorted_rms = np.sort(frame_rms)
+            # 하위 10%를 노이즈, 상위 50%를 시그널로 추정
+            noise_floor = float(np.mean(sorted_rms[:max(1, n_frames // 10)]))
+            signal_level = float(np.mean(sorted_rms[n_frames // 2:]))
+            if noise_floor > 1e-8:
+                snr_db = 20 * np.log10(signal_level / noise_floor)
+            else:
+                snr_db = 60.0  # 노이즈가 거의 없음
+            stats["snr_db"] = round(float(snr_db), 1)
+        else:
+            stats["snr_db"] = 0.0
+    else:
+        # 청크 모드: PCM 없음 → 추정 불가 필드는 null
+        stats["rms"] = None
+        stats["snr_db"] = None
+        stats["clipping_ratio"] = None
+
+    # qualityFactor: bitrate*0.3 + snr*0.5 + sampleRate*0.2
+    bitrate_val = stats.get("bitrate", 0) or 0
+    snr_val = stats.get("snr_db") if stats.get("snr_db") is not None else 0
+    bitrate_score = min(1.0, bitrate_val / 192)
+    snr_score = min(1.0, snr_val / 42)
+    sr_score = 0.8  # 리샘플링 후 항상 16kHz mono
+    stats["quality_factor"] = round(bitrate_score * 0.3 + snr_score * 0.5 + sr_score * 0.2, 2)
+
+    return stats
+
+
+def _clean_segments(raw_segments: list[dict]) -> list[dict]:
+    """WhisperX 결과 세그먼트를 정리한다 (word 데이터 보존)."""
+    segments = []
+    for seg in raw_segments:
+        segment = {
+            "start": round(seg.get("start", 0), 2),
+            "end": round(seg.get("end", 0), 2),
+            "text": seg.get("text", "").strip(),
+        }
+        if "speaker" in seg:
+            segment["speaker"] = seg["speaker"]
+        if "words" in seg:
+            segment["words"] = [
+                {
+                    "word": w.get("word", ""),
+                    "start": round(w.get("start", 0), 2),
+                    "end": round(w.get("end", 0), 2),
+                    "speaker": w.get("speaker"),
+                }
+                for w in seg["words"]
+                if w.get("start") is not None and w.get("end") is not None
+            ]
+        segments.append(segment)
+    return segments
+
+
+def _offset_segments(segments: list[dict], offset: float) -> list[dict]:
+    """세그먼트/워드의 start/end에 오프셋을 더한다 (불변)."""
+    result = []
+    for seg in segments:
+        new_seg = {
+            **seg,
+            "start": round(seg["start"] + offset, 2),
+            "end": round(seg["end"] + offset, 2),
+        }
+        if "words" in seg and seg["words"]:
+            new_seg["words"] = [
+                {**w, "start": round(w["start"] + offset, 2), "end": round(w["end"] + offset, 2)}
+                for w in seg["words"]
+            ]
+        result.append(new_seg)
+    return result
+
+
+def _cleanup_temp_files() -> None:
+    """서버 시작 시 이전 세션의 잔여 임시 파일을 정리한다."""
+    import glob
+    cleaned = 0
+
+    # TEMP_DIR: 업로드 원본 + 청크 WAV + denoise 임시 파일
+    for pattern in ("*.m4a", "*.wav", "*.mp3", "*.ogg", "*.flac", "*.webm", "*.mp4", "*.raw"):
+        for f in glob.glob(str(config.TEMP_DIR / pattern)):
+            try:
+                os.unlink(f)
+                cleaned += 1
+            except OSError:
+                pass
+
+    # RESULTS_DIR: 이전 세션의 WAV 결과 디렉토리
+    if config.RESULTS_DIR.exists():
+        import shutil
+        for d in config.RESULTS_DIR.iterdir():
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+                cleaned += 1
+
+    if cleaned > 0:
+        logger.info("이전 세션 잔여 파일 %d개 정리 완료", cleaned)
+
+
+def load_models():
+    """WhisperX 모델을 전역으로 로딩한다."""
+    global _model, _align_model, _align_metadata, _diarize_model
+
+    _cleanup_temp_files()
+
+    logger.info("WhisperX 모델 로딩 시작 (model=%s, device=%s)...", config.MODEL_SIZE, config.DEVICE)
+    start = time.time()
+
+    asr_options = {}
+    if config.HOTWORDS:
+        asr_options["hotwords"] = config.HOTWORDS
+        logger.info("Hotwords 설정: %s", config.HOTWORDS)
+    if config.INITIAL_PROMPT:
+        asr_options["initial_prompt"] = config.INITIAL_PROMPT
+        logger.info("Initial prompt 설정: %s", config.INITIAL_PROMPT[:50])
+
+    _model = whisperx.load_model(
+        config.MODEL_SIZE,
+        device=config.DEVICE,
+        compute_type=config.COMPUTE_TYPE,
+        language=config.LANGUAGE,
+        asr_options=asr_options if asr_options else None,
+    )
+
+    # Forced alignment 모델
+    _align_model, _align_metadata = whisperx.load_align_model(
+        language_code=config.LANGUAGE,
+        device=config.DEVICE,
+    )
+
+    # 화자분리 모델 (HF_TOKEN이 있을 때만)
+    if config.HF_TOKEN:
+        logger.info("화자분리 모델 로딩 중 (HF_TOKEN 감지)...")
+        try:
+            _diarize_model = DiarizationPipeline(
+                token=config.HF_TOKEN,
+                device=config.DEVICE,
+            )
+        except Exception as e:
+            logger.warning("화자분리 모델 로딩 실패 — 화자분리 비활성화: %s", e)
+            _diarize_model = None
+    else:
+        logger.info("HF_TOKEN 미설정 — 화자분리 비활성화")
+
+    # DeepFilterNet: denoise 플래그가 켜진 경우에만 로딩 (VRAM/메모리 절약)
+    if config.PREPROCESS_DENOISE_ENABLED:
+        logger.info("DeepFilterNet 상주 워커 로딩 중 (PREPROCESS_DENOISE_ENABLED=true)")
+        load_df_model()
+    else:
+        logger.info("PREPROCESS_DENOISE_ENABLED=false — DeepFilterNet 미로딩")
+
+    elapsed = time.time() - start
+    logger.info("모델 로딩 완료 (%.1f초)", elapsed)
+
+
+def _transcribe_chunk(
+    audio: np.ndarray,
+    task_id: str,
+    enable_diarize: bool,
+) -> list[dict]:
+    """단일 청크를 GPU 추론하고 정리된 세그먼트를 반환한다."""
+    # GPU 추론 (전처리는 호출자가 이미 적용)
+    _gpu_lock.acquire()
+    logger.info("[%s] GPU lock 획득", task_id)
+    try:
+        result = _model.transcribe(audio, batch_size=config.BATCH_SIZE)
+        logger.info("[%s] Transcribe 완료 (%d 세그먼트)", task_id, len(result["segments"]))
+
+        try:
+            result = whisperx.align(
+                result["segments"], _align_model, _align_metadata,
+                audio, config.DEVICE, return_char_alignments=False,
+            )
+            logger.info("[%s] Alignment 완료", task_id)
+        except Exception as align_err:
+            logger.warning("[%s] Alignment 실패: %s", task_id, align_err)
+
+        if enable_diarize and _diarize_model is not None:
+            try:
+                diarize_segments = _diarize_model(audio)
+                result = whisperx.assign_word_speakers(diarize_segments, result)
+                logger.info("[%s] 화자분리 완료", task_id)
+            except Exception as diarize_err:
+                logger.warning("[%s] 화자분리 실패: %s", task_id, diarize_err)
+    finally:
+        torch.cuda.empty_cache()
+        _gpu_lock.release()
+        logger.info("[%s] GPU lock 해제 (VRAM 정리 완료)", task_id)
+
+    return _clean_segments(result["segments"])
+
+
+def _transcribe_chunked(
+    file_path: Path,
+    task_id: str,
+    total_duration: float,
+    enable_diarize: bool,
+    split_by_utterance: bool = False,
+) -> tuple[list[dict], list[dict], dict[str, bytes]]:
+    """대용량 오디오를 무음 기반으로 청크 분할하여 처리한다.
+
+    Returns:
+        (all_segments, all_utterances, audio_files)
+
+    `split_by_utterance=True`이고 화자분리가 활성화된 경우, 각 청크의
+    `chunk_audio`가 메모리에 상주해 있는 동안 chunk-local 좌표계로
+    utterance 경계를 산출하고 바로 WAV 바이트를 생성한다. 이후 메타데이터
+    타임스탬프를 누적 offset으로 globalize한다. 전체 원본을 한 번도 메모리에
+    올리지 않으므로 청크 모드의 OOM 제약을 그대로 유지한다.
+    """
+    logger.info("[%s] 청크 모드 시작 (총 %.0f초, 목표 청크 %ds)", task_id, total_duration, config.CHUNK_DURATION_SEC)
+
+    # 1. 무음 지점 탐지
+    silence_points = _detect_silence_points(file_path)
+    logger.info("[%s] 무음 지점 %d개 감지", task_id, len(silence_points))
+
+    # 2. 분할 지점 결정
+    split_points = _find_split_points(
+        silence_points, total_duration,
+        config.CHUNK_DURATION_SEC, config.CHUNK_MARGIN_SEC,
+    )
+    logger.info("[%s] 분할 지점 %d개: %s", task_id, len(split_points),
+                [f"{p:.0f}s" for p in split_points])
+
+    # 3. 청크 경계 계산
+    boundaries = [0.0] + split_points + [total_duration]
+    all_segments: list[dict] = []
+    all_utterances: list[dict] = []
+    audio_files: dict[str, bytes] = {}
+    global_utt_idx = 0
+    # 전처리된 연속 타임라인 누적 offset — 각 청크의 전처리 후 실제 길이를 누적하여
+    # 청크 경계에서 silence compression 등으로 삭제된 구간이 타임스탬프 gap으로
+    # 나타나지 않도록 보정한다.
+    cumulative_preprocessed_offset = 0.0
+    diarize_active = enable_diarize and _diarize_model is not None
+    emit_utterances = split_by_utterance and diarize_active
+
+    for i in range(len(boundaries) - 1):
+        chunk_start = boundaries[i]
+        chunk_end = boundaries[i + 1]
+        chunk_idx = i + 1
+        total_chunks = len(boundaries) - 1
+
+        logger.info("[%s] 청크 %d/%d 처리 중 (%.0fs~%.0fs, %.0f초)",
+                    task_id, chunk_idx, total_chunks, chunk_start, chunk_end, chunk_end - chunk_start)
+
+        # ffmpeg로 청크 WAV 추출
+        chunk_path = config.TEMP_DIR / f"{task_id}_chunk_{i:03d}.wav"
+        _extract_chunk(file_path, chunk_start, chunk_end, chunk_path)
+
+        try:
+            # 청크 로딩 + 전처리 + 처리
+            chunk_audio = whisperx.load_audio(str(chunk_path))
+            original_chunk_duration = len(chunk_audio) / config.SAMPLE_RATE
+            chunk_audio = preprocess(chunk_audio, config.SAMPLE_RATE)
+            preprocessed_chunk_duration = len(chunk_audio) / config.SAMPLE_RATE
+
+            if preprocessed_chunk_duration < original_chunk_duration - 0.1:
+                logger.info(
+                    "[%s] 청크 %d/%d 전처리 길이 변경: %.1fs → %.1fs (%.1fs 감소)",
+                    task_id, chunk_idx, total_chunks,
+                    original_chunk_duration, preprocessed_chunk_duration,
+                    original_chunk_duration - preprocessed_chunk_duration,
+                )
+
+            chunk_segments = _transcribe_chunk(chunk_audio, task_id, enable_diarize)
+
+            # 청크 내 발화 분리 + WAV 생성 (chunk_audio가 살아있는 동안 수행)
+            if emit_utterances:
+                chunk_utts, chunk_files, global_utt_idx = emit_chunk_utterances(
+                    chunk_audio,
+                    chunk_segments,
+                    preprocessed_chunk_duration,
+                    cumulative_preprocessed_offset,
+                    global_utt_idx,
+                    config.SAMPLE_RATE,
+                )
+                all_utterances.extend(chunk_utts)
+                audio_files.update(chunk_files)
+
+            # 타임스탬프를 전처리된 연속 타임라인에 배치 (누적 offset 사용)
+            offset_segments = _offset_segments(chunk_segments, cumulative_preprocessed_offset)
+            all_segments.extend(offset_segments)
+
+            cumulative_preprocessed_offset += preprocessed_chunk_duration
+
+            logger.info("[%s] 청크 %d/%d 완료 (%d 세그먼트, 누적 %.1fs)",
+                        task_id, chunk_idx, total_chunks, len(chunk_segments), cumulative_preprocessed_offset)
+        finally:
+            # 청크 파일 삭제 + 메모리 해제
+            chunk_path.unlink(missing_ok=True)
+            try:
+                del chunk_audio
+            except UnboundLocalError:
+                pass
+            torch.cuda.empty_cache()
+
+    logger.info(
+        "[%s] 청크 모드 완료 (총 %d 세그먼트, %d 발화, 전처리 후 총 길이 %.1fs / 원본 %.1fs)",
+        task_id, len(all_segments), len(all_utterances),
+        cumulative_preprocessed_offset, total_duration,
+    )
+    return all_segments, all_utterances, audio_files
+
+
+def transcribe(
+    file_path: str,
+    task_id: str,
+    enable_diarize: bool = False,
+    enable_name_masking: bool = False,
+    mask_pii: bool = True,
+    split_by_speaker: bool = False,
+    split_by_utterance: bool = False,
+    denoise_enabled: bool | None = None,
+) -> dict:
+    """음성 파일을 STT 처리하고 마스킹된 결과를 반환한다.
+
+    오디오가 CHUNK_THRESHOLD_SEC 이상이면 무음 기반 청크 분할 모드로 전환하여
+    메모리 사용량을 일정하게 유지한다.
+    """
+    file_path = Path(file_path)
+
+    try:
+        logger.info("[%s] STT 시작: %s", task_id, file_path.name)
+        start = time.time()
+
+        # 0. 오디오 길이 확인 (메모리 사용 없음)
+        total_duration = _get_audio_duration(file_path)
+        use_chunked = total_duration > config.CHUNK_THRESHOLD_SEC
+
+        # 청크 모드에서만 채워지는 버킷. 일반 모드 경로에서도 이름이 정의돼 있도록
+        # 미리 초기화해 short-circuit 조건에 의존하지 않게 한다.
+        chunked_utterances: list[dict] = []
+        chunked_audio_files: dict[str, bytes] = {}
+
+        if use_chunked:
+            # ── 청크 모드: 대용량 오디오 ──
+            # 발화 WAV는 청크 내부에서 바로 생성된다. 화자별 WAV는 전체 배열이 필요하므로
+            # 청크 모드에서는 제공하지 않는다 (API 스펙에 명시).
+            segments, chunked_utterances, chunked_audio_files = _transcribe_chunked(
+                file_path, task_id, total_duration, enable_diarize,
+                split_by_utterance=split_by_utterance,
+            )
+            audio = None
+            diarize_active = enable_diarize and _diarize_model is not None
+        else:
+            # ── 일반 모드: 전체 로딩 + 전처리 ──
+            audio = whisperx.load_audio(str(file_path))
+            logger.info("[%s] 오디오 로드 완료 (%.1fs)", task_id, len(audio) / config.SAMPLE_RATE)
+            audio = preprocess(audio, config.SAMPLE_RATE)
+
+            _gpu_lock.acquire()
+            logger.info("[%s] GPU lock 획득", task_id)
+            try:
+                result = _model.transcribe(audio, batch_size=config.BATCH_SIZE)
+                logger.info("[%s] Transcribe 완료 (%d 세그먼트)", task_id, len(result["segments"]))
+
+                try:
+                    result = whisperx.align(
+                        result["segments"], _align_model, _align_metadata,
+                        audio, config.DEVICE, return_char_alignments=False,
+                    )
+                    logger.info("[%s] Alignment 완료", task_id)
+                except Exception as align_err:
+                    logger.warning("[%s] Alignment 실패: %s", task_id, align_err)
+
+                try:
+                    if enable_diarize and _diarize_model is not None:
+                        diarize_segments = _diarize_model(audio)
+                        result = whisperx.assign_word_speakers(diarize_segments, result)
+                        logger.info("[%s] 화자분리 완료", task_id)
+                    elif enable_diarize and _diarize_model is None:
+                        logger.warning("[%s] 화자분리 요청했으나 HF_TOKEN 미설정으로 건너뜀", task_id)
+                except Exception as diarize_err:
+                    logger.warning("[%s] 화자분리 실패: %s", task_id, diarize_err)
+            finally:
+                torch.cuda.empty_cache()
+                _gpu_lock.release()
+                logger.info("[%s] GPU lock 해제 (VRAM 정리 완료)", task_id)
+
+            segments = _clean_segments(result["segments"])
+            diarize_active = enable_diarize and _diarize_model is not None
+
+        # 5. PII 마스킹
+        pii_summary = mask_segments(segments, enable_name_masking) if mask_pii else []
+
+        # 6. 전체 텍스트
+        full_text = " ".join(s["text"] for s in segments)
+
+        # 6.5 화자/발화 분리 (일반 모드 + diarize 활성화 시에만)
+        utterances_result = None
+        speaker_audio_result = None
+        audio_files = {}
+
+        # 청크 모드에서는 _transcribe_chunked가 발화/WAV를 이미 생성했다.
+        # 화자별 WAV(speaker_audio)는 청크 모드에서 제공되지 않는다.
+        if use_chunked and split_by_utterance and diarize_active and chunked_utterances:
+            utterances_result = chunked_utterances
+            audio_files.update(chunked_audio_files)
+            logger.info("[%s] 청크 모드 발화 %d개 복원", task_id, len(utterances_result))
+
+        if audio is not None and diarize_active and (split_by_speaker or split_by_utterance):
+            total_dur = len(audio) / config.SAMPLE_RATE
+
+            if split_by_utterance:
+                all_words = []
+                for s in segments:
+                    if s.get("words"):
+                        for w in s["words"]:
+                            all_words.append({
+                                "word": w.get("word", ""),
+                                "start": w.get("start", s["start"]),
+                                "end": w.get("end", s["end"]),
+                                "speaker": w.get("speaker", s.get("speaker")),
+                            })
+                    else:
+                        all_words.append({
+                            "word": s.get("text", ""),
+                            "start": s["start"],
+                            "end": s["end"],
+                            "speaker": s.get("speaker"),
+                        })
+
+                for i, w in enumerate(all_words):
+                    if w["speaker"] is None:
+                        if i > 0 and all_words[i - 1]["speaker"] is not None:
+                            w["speaker"] = all_words[i - 1]["speaker"]
+                        elif i + 1 < len(all_words) and all_words[i + 1]["speaker"] is not None:
+                            w["speaker"] = all_words[i + 1]["speaker"]
+                        else:
+                            w["speaker"] = "SPEAKER_0"
+
+                utterance_boundaries = segment_utterances(all_words, total_dur)
+                utterances_result = []
+                for idx, utt in enumerate(utterance_boundaries):
+                    utt_audio = extract_utterance_audio(audio, utt, config.SAMPLE_RATE)
+                    filename = f"utterance_{idx:03d}.wav"
+                    audio_files[filename] = to_wav_bytes(utt_audio, config.SAMPLE_RATE)
+                    utterances_result.append({
+                        "index": idx,
+                        "start_sec": utt.start_sec,
+                        "end_sec": utt.end_sec,
+                        "duration_sec": utt.duration_sec,
+                        "speaker_id": utt.speaker_id,
+                        "transcript_text": utt.transcript_text,
+                        "audio_filename": filename,
+                        "words": list(utt.words),
+                    })
+                logger.info("[%s] 발화 %d개 분리 완료", task_id, len(utterances_result))
+
+            if split_by_speaker:
+                speaker_ids = sorted(set(
+                    s.get("speaker", "SPEAKER_0") for s in segments
+                    if s.get("speaker") is not None
+                ))
+                speaker_audio_result = []
+                for sid in speaker_ids:
+                    muted = mute_non_speaker(audio, segments, sid, config.SAMPLE_RATE)
+                    filename = f"speaker_{sid.lower()}.wav"
+                    audio_files[filename] = to_wav_bytes(muted, config.SAMPLE_RATE)
+                    speaker_audio_result.append({
+                        "speaker_id": sid,
+                        "total_duration_sec": round(len(audio) / config.SAMPLE_RATE, 2),
+                        "audio_filename": filename,
+                    })
+                logger.info("[%s] 화자 %d명 오디오 분리 완료", task_id, len(speaker_audio_result))
+
+        elapsed = time.time() - start
+
+        # 오디오 통계 계산
+        file_size = file_path.stat().st_size if file_path.exists() else 0
+        audio_stats = _compute_audio_stats(
+            audio, config.SAMPLE_RATE, segments, total_duration, file_size,
+        )
+
+        output = {
+            "task_id": task_id,
+            "status": "completed",
+            "language": config.LANGUAGE,
+            "duration_seconds": round(total_duration, 2),
+            "processing_seconds": round(elapsed, 2),
+            "segments": segments,
+            "full_text": full_text,
+            "pii_summary": pii_summary,
+            "diarization_enabled": diarize_active,
+            "audio_stats": audio_stats,
+        }
+
+        if utterances_result is not None:
+            output["utterances"] = utterances_result
+        if speaker_audio_result is not None:
+            output["speaker_audio"] = speaker_audio_result
+        if audio_files:
+            output["_audio_files"] = audio_files
+        if use_chunked:
+            output["chunked_processing"] = True
+
+        logger.info("[%s] 완료 (%.1f초, PII %d건 마스킹%s)",
+                    task_id, elapsed, len(pii_summary),
+                    ", 청크 모드" if use_chunked else "")
+        return output
+
+    finally:
+        # 원본 음성 파일 삭제
+        try:
+            if file_path.exists():
+                os.unlink(file_path)
+                logger.info("[%s] 음성 파일 삭제 완료", task_id)
+        except OSError as e:
+            logger.warning("[%s] 음성 파일 삭제 실패: %s", task_id, e)
+
+        # 청크 모드 잔여 파일 정리 (OOM/크래시 대비)
+        import glob
+        for chunk_file in glob.glob(str(config.TEMP_DIR / f"{task_id}_chunk_*.wav")):
+            try:
+                os.unlink(chunk_file)
+            except OSError:
+                pass

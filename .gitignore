@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.py[co]
+.pytest_cache/
+.coverage
+.DS_Store
+._*
+.env
+.env.dev
+.env.live
+sample_data/
+logs/
+*.log
+!.claude/
+*.bak
+.claude/settings.local.json

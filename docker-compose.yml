@@ -1,0 +1,22 @@
+services:
+  voice-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - MODEL_SIZE=large-v3
+      - DEVICE=cuda
+      - COMPUTE_TYPE=float16
+      - LANGUAGE=ko
+    volumes:
+      - /dev/shm/stt-temp:/dev/shm/stt-temp
+      - /dev/shm/stt-results:/dev/shm/stt-results
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
