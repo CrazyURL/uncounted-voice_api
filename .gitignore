@@ -13,4 +13,6 @@ logs/
 *.log
 !.claude/
 *.bak
+*.bak_*
+mindvault-out/
 .claude/settings.local.json

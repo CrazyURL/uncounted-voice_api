@@ -73,6 +73,11 @@ PREPROCESS_FRAME_MS = int(os.environ.get("PREPROCESS_FRAME_MS", "20"))
 SILENCE_COMPRESS_MIN_SEC = float(os.environ.get("SILENCE_COMPRESS_MIN_SEC", "1.0"))
 SILENCE_COMPRESS_TARGET_SEC = float(os.environ.get("SILENCE_COMPRESS_TARGET_SEC", "0.5"))
 
+# denoise 후 silence_compress가 사용할 동적 임계값 (Round 3 진단 실측 p50=0.00090 기준)
+# DeepFilterNet이 voice RMS를 median 23배 감쇠시키므로 기본 0.005 threshold가 cascade 손실을 유발.
+# 0.0005로 낮추어 감쇠된 voice frame이 silence로 오분류되지 않게 한다.
+SILENCE_RMS_THRESHOLD_DENOISE = float(os.environ.get("SILENCE_RMS_THRESHOLD_DENOISE", "0.0005"))
+
 # Gain Normalize 최대 증폭 (노이즈 증폭 방지)
 MAX_GAIN_X = float(os.environ.get("MAX_GAIN_X", "10.0"))
 

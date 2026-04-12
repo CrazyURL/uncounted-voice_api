@@ -302,12 +302,19 @@ def remove_duplicates(audio: np.ndarray, sr: int) -> np.ndarray:
 # ③ Silence Compression (RMS energy)
 # ---------------------------------------------------------------------------
 
-def compress_silence(audio: np.ndarray, sr: int) -> np.ndarray:
+def compress_silence(
+    audio: np.ndarray,
+    sr: int,
+    rms_threshold: float | None = None,
+) -> np.ndarray:
     """긴 무음 구간을 SILENCE_COMPRESS_TARGET_SEC(기본 0.5초)로 압축한다.
 
     20ms 프레임 단위로 RMS 에너지를 계산하여 무음을 탐지한다.
     SILENCE_COMPRESS_MIN_SEC(기본 1.0초) 초과하는 무음만 압축 대상.
     짧은 자연스러운 침묵은 보존한다.
+
+    rms_threshold가 명시되면 해당 값을 사용(denoise 후 동적 하향용),
+    None이면 config.SILENCE_RMS_THRESHOLD(기본 0.005)를 사용한다.
     """
     frame_samples = int(config.PREPROCESS_FRAME_MS / 1000 * sr)
     if frame_samples < 1 or len(audio) < frame_samples:
@@ -315,12 +322,13 @@ def compress_silence(audio: np.ndarray, sr: int) -> np.ndarray:
 
     min_silence_samples = int(config.SILENCE_COMPRESS_MIN_SEC * sr)
     target_silence_samples = int(config.SILENCE_COMPRESS_TARGET_SEC * sr)
+    threshold = rms_threshold if rms_threshold is not None else config.SILENCE_RMS_THRESHOLD
 
     # RMS 에너지 계산
     n_frames = len(audio) // frame_samples
     frames = audio[:n_frames * frame_samples].reshape(n_frames, frame_samples)
     rms = np.sqrt(np.mean(frames ** 2, axis=1))
-    is_silent = rms < config.SILENCE_RMS_THRESHOLD
+    is_silent = rms < threshold
 
     # 무음 구간 탐지
     silence_regions: list[tuple[int, int]] = []
@@ -422,11 +430,22 @@ def preprocess(
 
     # 인자 denoise_enabled가 명시되면 우선, 없으면 config 사용
     denoise_on = denoise_enabled if denoise_enabled is not None else config.PREPROCESS_DENOISE_ENABLED
+
     if denoise_on:
         t = time.time()
         result = denoise(result, sr)
         timings["denoise"] = time.time() - t
         applied.append("denoise")
+
+        # Round 3 cascade fix: denoise가 voice RMS를 median 23배 감쇠시키므로 (실측)
+        # normalize_gain을 재호출해 진폭을 복원한다. MAX_GAIN_X=10으로 증폭 한계가 걸리므로
+        # 완전 복원은 불가하며 silence threshold 하향(아래)과 함께 사용한다.
+        # 자세한 내용: uncounted-docs/voice-api/전처리_파이프라인_재활성화.md Round 3
+        if config.PREPROCESS_GAIN_ENABLED:
+            t = time.time()
+            result = normalize_gain(result)
+            timings["regain"] = time.time() - t
+            applied.append("regain")
 
     if config.PREPROCESS_DEDUP_ENABLED:
         t = time.time()
@@ -436,7 +455,9 @@ def preprocess(
 
     if config.PREPROCESS_SILENCE_ENABLED:
         t = time.time()
-        result = compress_silence(result, sr)
+        # denoise 후에는 동적 임계값(0.0005)으로 cascade 손실 방지
+        silence_threshold = config.SILENCE_RMS_THRESHOLD_DENOISE if denoise_on else None
+        result = compress_silence(result, sr, rms_threshold=silence_threshold)
         timings["silence"] = time.time() - t
         applied.append("silence")
 
