@@ -16,3 +16,6 @@ logs/
 *.bak_*
 mindvault-out/
 .claude/settings.local.json
+
+# 벤치마크 산출물 (PII 포함, 커밋 금지)
+compare-*.md

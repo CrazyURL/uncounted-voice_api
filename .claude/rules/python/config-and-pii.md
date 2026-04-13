@@ -16,7 +16,7 @@
 
 | Variable | Default | Notes |
 |----------|---------|-------|
-| `MODEL_SIZE` | `large-v3` | WhisperX model size |
+| `MODEL_SIZE` | `large-v3` (config.py 기본값) | dev 환경은 `.env.dev`로 `large-v3-turbo` 오버라이드 (2026-04-13 전환). live는 large-v3 유지 |
 | `DEVICE` | `cuda` | `cuda` or `cpu` |
 | `COMPUTE_TYPE` | `float16` | Model precision |
 | `LANGUAGE` | `ko` | Target language |
