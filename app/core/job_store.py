@@ -53,6 +53,14 @@ class JobStore:
         with self._lock:
             return self._tasks.get(task_id)
 
+    def active_count(self) -> int:
+        """pending + processing 상태인 작업 수 (큐 백프레셔용)."""
+        with self._lock:
+            return sum(
+                1 for t in self._tasks.values()
+                if t.status in (TaskStatus.pending, TaskStatus.processing)
+            )
+
     def update_status(self, task_id: str, status: TaskStatus) -> None:
         with self._lock:
             if task_id in self._tasks:

@@ -153,6 +153,24 @@ async def transcribe_audio(
     if ext not in config.ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported format: {ext}")
 
+    # 큐 백프레셔: pending + processing 합산이 한계 이상이면 503 반환
+    active = job_store.active_count()
+    if active >= config.MAX_ACTIVE_JOBS:
+        retry_after = config.QUEUE_FULL_RETRY_AFTER_SEC
+        logger.warning(
+            "[queue-full] active=%d limit=%d — 503 reject", active, config.MAX_ACTIVE_JOBS
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "queue_full",
+                "active_jobs": active,
+                "max_active_jobs": config.MAX_ACTIVE_JOBS,
+                "retry_after_sec": retry_after,
+            },
+            headers={"Retry-After": str(retry_after)},
+        )
+
     # 임시 저장 경로 준비
     task_id = uuid.uuid4().hex[:12]
     config.TEMP_DIR.mkdir(parents=True, exist_ok=True)

@@ -369,6 +369,35 @@ class ErrorResponse(BaseModel):
     )
 
 
+class QueueStatus(BaseModel):
+    """큐 백프레셔 상태 정보.
+
+    `POST /api/v1/transcribe`는 `active >= max_active` 조건에서 503을 반환합니다.
+    모니터링/대시보드에서 이 값을 폴링하여 큐 포화 상태를 관측할 수 있습니다.
+    """
+
+    active: int = Field(
+        ...,
+        description="현재 pending + processing 상태인 작업 수",
+        examples=[3],
+        ge=0,
+    )
+    max_active: int = Field(
+        ...,
+        description="서버 설정의 최대 동시 작업 수 (`MAX_ACTIVE_JOBS`). "
+        "이 값에 도달하면 신규 POST는 503 반환.",
+        examples=[5],
+        ge=1,
+    )
+    utilization_pct: float = Field(
+        ...,
+        description="큐 사용률 (%) = active / max_active * 100. "
+        "100 이상은 큐 포화 상태.",
+        examples=[60.0],
+        ge=0,
+    )
+
+
 class HealthResponse(BaseModel):
     """서버 상태 및 GPU/모델 정보."""
 
@@ -407,6 +436,10 @@ class HealthResponse(BaseModel):
         description="WhisperX 모델이 GPU 메모리에 로딩 완료되었는지 여부. "
         "`false`이면 아직 시작 중이므로 STT 요청을 보내면 안 됩니다.",
     )
+    queue: QueueStatus = Field(
+        ...,
+        description="큐 백프레셔 상태 (active / max_active / utilization_pct)",
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -419,6 +452,11 @@ class HealthResponse(BaseModel):
                     "device": "cuda",
                     "gpu": "NVIDIA GeForce RTX 4090",
                     "model_loaded": True,
+                    "queue": {
+                        "active": 3,
+                        "max_active": 5,
+                        "utilization_pct": 60.0,
+                    },
                 },
             ],
         },

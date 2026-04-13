@@ -25,6 +25,10 @@ RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", "/dev/shm/stt-results"))
 MAX_UPLOAD_SIZE = int(os.environ.get("MAX_UPLOAD_SIZE", str(500 * 1024 * 1024)))
 ALLOWED_EXTENSIONS = {"wav", "mp3", "m4a", "ogg", "flac", "webm", "mp4"}
 
+# 큐 백프레셔: pending + processing 합산이 이 값 이상이면 POST /transcribe는 503 반환
+MAX_ACTIVE_JOBS = int(os.environ.get("MAX_ACTIVE_JOBS", "5"))
+QUEUE_FULL_RETRY_AFTER_SEC = int(os.environ.get("QUEUE_FULL_RETRY_AFTER_SEC", "30"))
+
 # 발화 분리 (Utterance Segmentation)
 SILENCE_GAP_SEC = float(os.environ.get("SILENCE_GAP_SEC", "0.5"))
 MIN_UTTERANCE_SEC = float(os.environ.get("MIN_UTTERANCE_SEC", "5.0"))

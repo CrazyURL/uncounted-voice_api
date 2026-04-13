@@ -33,6 +33,14 @@
 | `RESULTS_DIR` | `/dev/shm/stt-results` | Result WAV storage |
 | `MAX_UPLOAD_SIZE` | `524288000` | Upload size limit (500MB) |
 
+### Queue Backpressure
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `MAX_ACTIVE_JOBS` | `5` | pending + processing 합산이 이 값에 도달하면 `POST /transcribe`는 503 반환 |
+| `QUEUE_FULL_RETRY_AFTER_SEC` | `30` | 503 응답의 `Retry-After` 헤더 + JSON body `detail.retry_after_sec` 값 |
+| `TESTING` | (unset) | `1`로 설정 시 lifespan에서 WhisperX 모델 로딩을 스킵 (pytest 전용) |
+
 ### Audio Preprocessing
 
 | Variable | Default | Notes |

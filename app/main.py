@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -17,10 +18,17 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    whisperx_service.load_models()
-    logger.info("=" * 50)
-    logger.info("모델 로딩 완료 - 요청 대기 중")
-    logger.info("=" * 50)
+    # 테스트 환경(`TESTING=1`)에서는 WhisperX/pyannote 모델 로딩을 건너뛴다.
+    # 이유: 실제 서버가 이미 GPU를 점유 중인 상태에서 TestClient가 lifespan을
+    # 트리거하면 CUDA OOM이 발생한다. 테스트는 엔드포인트 로직만 검증하므로
+    # 모델 없이 동작한다.
+    if os.environ.get("TESTING") == "1":
+        logger.info("TESTING=1 — 모델 로딩 스킵")
+    else:
+        whisperx_service.load_models()
+        logger.info("=" * 50)
+        logger.info("모델 로딩 완료 - 요청 대기 중")
+        logger.info("=" * 50)
     yield
     logger.info("서버 종료")
 
