@@ -111,7 +111,11 @@ class JobStore:
 
 
     def _cleanup_expired(self) -> None:
-        """Remove completed/failed tasks older than MAX_COMPLETED_AGE_SEC. Must hold lock."""
+        """Remove completed/failed tasks older than MAX_COMPLETED_AGE_SEC. Must hold lock.
+
+        Also marks pending/processing tasks as failed if they exceed MAX_PROCESSING_AGE_SEC
+        to prevent stuck jobs from blocking the queue indefinitely.
+        """
         now = time.time()
         expired = []
         for task_id, ts in self._timestamps.items():
@@ -120,6 +124,15 @@ class JobStore:
                 expired.append(task_id)
                 continue
             age = now - ts
+            if task.status in (TaskStatus.pending, TaskStatus.processing):
+                if age > config.MAX_PROCESSING_AGE_SEC:
+                    logger.warning(
+                        "[%s] Stuck job detected (status=%s, age=%.0fs) — marking failed",
+                        task_id, task.status.value, age,
+                    )
+                    self._tasks[task_id] = task.model_copy(
+                        update={"status": TaskStatus.failed, "error": "processing_timeout"}
+                    )
             if age > MAX_COMPLETED_AGE_SEC and task.status in (TaskStatus.completed, TaskStatus.failed):
                 expired.append(task_id)
 

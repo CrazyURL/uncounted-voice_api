@@ -28,6 +28,8 @@ ALLOWED_EXTENSIONS = {"wav", "mp3", "m4a", "ogg", "flac", "webm", "mp4"}
 # 큐 백프레셔: pending + processing 합산이 이 값 이상이면 POST /transcribe는 503 반환
 MAX_ACTIVE_JOBS = int(os.environ.get("MAX_ACTIVE_JOBS", "5"))
 QUEUE_FULL_RETRY_AFTER_SEC = int(os.environ.get("QUEUE_FULL_RETRY_AFTER_SEC", "30"))
+# processing/pending 상태가 이 시간을 초과하면 stuck으로 간주하고 failed 처리
+MAX_PROCESSING_AGE_SEC = int(os.environ.get("MAX_PROCESSING_AGE_SEC", "1800"))  # 30분
 
 # 발화 분리 (Utterance Segmentation)
 SILENCE_GAP_SEC = float(os.environ.get("SILENCE_GAP_SEC", "0.5"))
