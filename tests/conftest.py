@@ -1,10 +1,17 @@
+import json
 import os
+import sys
+from unittest.mock import MagicMock
 
 import pytest
 
 # 테스트 환경임을 표시 — app/main.py의 lifespan이 이 값을 보고 모델 로딩을 스킵한다.
 # 이미 실행 중인 voice-api@dev 서비스와 GPU 점유 충돌을 피하기 위함.
 os.environ.setdefault("TESTING", "1")
+
+# Mock heavy whisperx module before any imports — torch is real (scipy uses it).
+sys.modules.setdefault("whisperx", MagicMock())
+sys.modules.setdefault("whisperx.diarize", MagicMock())
 
 from app.core.job_store import job_store  # noqa: E402
 
@@ -28,3 +35,33 @@ def clear_job_store():
     job_store._tasks.clear()
     yield
     job_store._tasks.clear()
+
+
+@pytest.fixture
+def utterance_431_words():
+    """Load utterance 431 hypothesis words (all SPEAKER_00, current buggy state).
+
+    Returns a copy, not a reference.
+    """
+    fixture_path = os.path.join(
+        os.path.dirname(__file__),
+        "fixtures/diarization/utterance_431_words.json"
+    )
+    with open(fixture_path) as f:
+        data = json.load(f)
+    return [dict(word) for word in data["words"]]
+
+
+@pytest.fixture
+def utterance_431_expected():
+    """Load utterance 431 reference words (with speaker switch at 3449-3456s).
+
+    Returns a copy, not a reference.
+    """
+    fixture_path = os.path.join(
+        os.path.dirname(__file__),
+        "fixtures/diarization/utterance_431_expected.json"
+    )
+    with open(fixture_path) as f:
+        data = json.load(f)
+    return [dict(word) for word in data["words"]]

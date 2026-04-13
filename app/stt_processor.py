@@ -14,6 +14,7 @@ from whisperx.diarize import DiarizationPipeline
 from app import config
 from app.pii_masker import mask_pii, mask_segments
 from app.services.audio_preprocessor import load_df_model, preprocess
+from app.services.diarization_config import DiarizationConfig
 from app.services.utterance_segmenter import segment as segment_utterances
 from app.services.audio_splitter import (
     extract_utterance_audio,
@@ -321,7 +322,7 @@ def _transcribe_chunk(
 
         if enable_diarize and _diarize_model is not None:
             try:
-                diarize_segments = _diarize_model(audio)
+                diarize_segments = _diarize_model(audio, **diarization_options)
                 result = whisperx.assign_word_speakers(diarize_segments, result)
                 logger.info("[%s] 화자분리 완료", task_id)
             except Exception as diarize_err:
@@ -468,6 +469,11 @@ def transcribe(
         logger.info("[%s] STT 시작: %s", task_id, file_path.name)
         start = time.time()
 
+        # Phase 2 (Option D): Load diarization config once at entry.
+        # Default mode to "call_recording" for all calls (voice-api has no mode concept yet).
+        diarization_config = DiarizationConfig.from_env()
+        diarization_options = diarization_config.resolve_options("call_recording")
+
         # 0. 오디오 길이 확인 (메모리 사용 없음)
         total_duration = _get_audio_duration(file_path)
         use_chunked = total_duration > config.CHUNK_THRESHOLD_SEC
@@ -510,7 +516,7 @@ def transcribe(
 
                 try:
                     if enable_diarize and _diarize_model is not None:
-                        diarize_segments = _diarize_model(audio)
+                        diarize_segments = _diarize_model(audio, **diarization_options)
                         result = whisperx.assign_word_speakers(diarize_segments, result)
                         logger.info("[%s] 화자분리 완료", task_id)
                     elif enable_diarize and _diarize_model is None:
