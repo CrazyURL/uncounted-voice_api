@@ -246,6 +246,73 @@ def _cleanup_temp_files() -> None:
         logger.info("이전 세션 잔여 파일 %d개 정리 완료", cleaned)
 
 
+def _apply_reclustering(
+    audio: "np.ndarray",
+    sample_rate: int,
+    result: dict,
+    task_id: str,
+) -> dict:
+    """WeSpeaker 재클러스터링 hook (Phase 7).
+
+    `assign_word_speakers` 직후 호출. flag/모델 미가용 시 byte-equivalent.
+    WhisperX `result["segments"]`에서 word를 평탄화해 hook에 전달하고,
+    반환된 새 speaker 라벨을 원본 segment의 word 위치에 다시 적용한다.
+    """
+    recluster_config = ReclusterConfig.from_env()
+    if not recluster_config.is_enabled_for("call_recording"):
+        return result
+
+    global _speaker_embedding_model
+    if _speaker_embedding_model is None:
+        _speaker_embedding_model = SpeakerEmbeddingModel()
+
+    # word를 평탄화하면서 (segment_idx, word_idx_in_segment) 위치 추적
+    flat_words: list[dict] = []
+    locations: list[tuple[int, int]] = []
+    for s_idx, seg in enumerate(result.get("segments", [])):
+        for w_idx, word in enumerate(seg.get("words", [])):
+            flat_words.append(word)
+            locations.append((s_idx, w_idx))
+
+    if not flat_words:
+        return result
+
+    recluster_start = time.time()
+    recluster_result = maybe_recluster_speakers(
+        audio=audio,
+        sample_rate=sample_rate,
+        words=flat_words,
+        segments=list(result.get("segments", [])),
+        mode="call_recording",
+        embedding_model=_speaker_embedding_model,
+    )
+    recluster_elapsed_ms = (time.time() - recluster_start) * 1000
+
+    if recluster_result.changed:
+        # 새 speaker_id를 WhisperX 컨벤션의 "speaker" 필드에도 동기화하면서
+        # 원본 segment.words[w_idx]를 immutable copy로 교체한다.
+        new_segments = [dict(seg) for seg in result["segments"]]
+        for seg in new_segments:
+            seg["words"] = list(seg.get("words", []))
+        for new_word, (s_idx, w_idx) in zip(recluster_result.words, locations):
+            updated = dict(new_word)
+            new_speaker = updated.get("speaker_id")
+            if new_speaker is not None:
+                updated["speaker"] = new_speaker
+            new_segments[s_idx]["words"][w_idx] = updated
+        result["segments"] = new_segments
+
+    logger.info(
+        "[%s] WeSpeaker 재클러스터링 완료 (windows=%d, confidence=%.2f, changed=%s, %.0fms)",
+        task_id,
+        recluster_result.window_count,
+        recluster_result.confidence,
+        recluster_result.changed,
+        recluster_elapsed_ms,
+    )
+    return result
+
+
 def load_models():
     """WhisperX 모델을 전역으로 로딩한다."""
     global _model, _align_model, _align_metadata, _diarize_model
@@ -335,31 +402,7 @@ def _transcribe_chunk(
                 logger.info("[%s] 화자분리 완료", task_id)
 
                 # Phase 7: WeSpeaker reclustering (chunked path)
-                recluster_config = ReclusterConfig.from_env()
-                if recluster_config.is_enabled_for("call_recording"):
-                    global _speaker_embedding_model
-                    if _speaker_embedding_model is None:
-                        _speaker_embedding_model = SpeakerEmbeddingModel()
-
-                    recluster_start = time.time()
-                    recluster_result = maybe_recluster_speakers(
-                        audio=audio,
-                        sample_rate=config.SAMPLE_RATE,
-                        words=result["segments"],
-                        segments=[],
-                        mode="call_recording",
-                        embedding_model=_speaker_embedding_model,
-                    )
-                    recluster_elapsed_ms = (time.time() - recluster_start) * 1000
-
-                    # Update result with reclustered words
-                    result["segments"] = list(recluster_result.words)
-
-                    logger.info(
-                        "[%s] WeSpeaker 재클러스터링 완료 (windows=%d, confidence=%.2f, changed=%s, %.0fms)",
-                        task_id, recluster_result.window_count, recluster_result.confidence,
-                        recluster_result.changed, recluster_elapsed_ms,
-                    )
+                result = _apply_reclustering(audio, config.SAMPLE_RATE, result, task_id)
             except Exception as diarize_err:
                 logger.warning("[%s] 화자분리 실패: %s", task_id, diarize_err)
     finally:
@@ -560,32 +603,8 @@ def transcribe(
                         result = whisperx.assign_word_speakers(diarize_segments, result)
                         logger.info("[%s] 화자분리 완료", task_id)
 
-                        # Phase 7: WeSpeaker reclustering (after assign_word_speakers)
-                        recluster_config = ReclusterConfig.from_env()
-                        if recluster_config.is_enabled_for("call_recording"):
-                            global _speaker_embedding_model
-                            if _speaker_embedding_model is None:
-                                _speaker_embedding_model = SpeakerEmbeddingModel()
-
-                            recluster_start = time.time()
-                            recluster_result = maybe_recluster_speakers(
-                                audio=audio,
-                                sample_rate=config.SAMPLE_RATE,
-                                words=result["segments"],
-                                segments=[],
-                                mode="call_recording",
-                                embedding_model=_speaker_embedding_model,
-                            )
-                            recluster_elapsed_ms = (time.time() - recluster_start) * 1000
-
-                            # Update result with reclustered words
-                            result["segments"] = list(recluster_result.words)
-
-                            logger.info(
-                                "[%s] WeSpeaker 재클러스터링 완료 (windows=%d, confidence=%.2f, changed=%s, %.0fms)",
-                                task_id, recluster_result.window_count, recluster_result.confidence,
-                                recluster_result.changed, recluster_elapsed_ms,
-                            )
+                        # Phase 7: WeSpeaker reclustering (non-chunked path)
+                        result = _apply_reclustering(audio, config.SAMPLE_RATE, result, task_id)
                     elif enable_diarize and _diarize_model is None:
                         logger.warning("[%s] 화자분리 요청했으나 HF_TOKEN 미설정으로 건너뜀", task_id)
                 except Exception as diarize_err:
