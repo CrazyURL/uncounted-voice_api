@@ -19,3 +19,6 @@ mindvault-out/
 
 # 벤치마크 산출물 (PII 포함, 커밋 금지)
 compare-*.md
+
+# WeSpeaker / pyannote model cache (Phase 4~7)
+models/
