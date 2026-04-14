@@ -151,7 +151,12 @@ async def transcribe_audio(
     # 확장자 검증
     ext = FilePath(file.filename or "").suffix.lstrip(".").lower()
     if ext not in config.ALLOWED_EXTENSIONS:
-        logger.warning("[reject-400] filename=%r ext=%r", file.filename, ext)
+        # 파일명은 전화번호·인명 PII를 포함할 수 있어 평문 로깅 금지. 확장자 + 길이만 기록.
+        logger.warning(
+            "[reject-400] ext=%r filename_len=%d",
+            ext,
+            len(file.filename or ""),
+        )
         raise HTTPException(400, f"Unsupported format: {ext}")
 
     # 큐 백프레셔: pending + processing 합산이 한계 이상이면 503 반환

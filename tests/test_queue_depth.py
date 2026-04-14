@@ -98,6 +98,52 @@ class TestQueueDepthEndpoint:
         assert response.status_code == 400
 
 
+class TestExtensionValidation:
+    """POST /transcribe 확장자 allowlist 및 거절 로그 PII 안전성 검증."""
+
+    def test_amr_extension_accepted(self, client, monkeypatch):
+        """Android 통화 녹음 포맷 amr이 400으로 거절되지 않아야 함."""
+        monkeypatch.setattr(config, "MAX_ACTIVE_JOBS", 5)
+        response = client.post(
+            "/api/v1/transcribe",
+            files={"file": ("call.amr", b"\x00" * 256, "audio/amr")},
+        )
+        assert response.status_code != 400
+        if response.status_code == 200:
+            assert "task_id" in response.json()
+
+    def test_3gp_extension_accepted(self, client, monkeypatch):
+        """Android 통화 녹음 포맷 3gp가 400으로 거절되지 않아야 함."""
+        monkeypatch.setattr(config, "MAX_ACTIVE_JOBS", 5)
+        response = client.post(
+            "/api/v1/transcribe",
+            files={"file": ("call.3gp", b"\x00" * 256, "audio/3gpp")},
+        )
+        assert response.status_code != 400
+
+    def test_reject_400_log_omits_filename(self, client, monkeypatch, caplog):
+        """지원하지 않는 확장자 거절 시 warning 로그에 파일명(PII) 기록 금지."""
+        import logging
+
+        monkeypatch.setattr(config, "MAX_ACTIVE_JOBS", 5)
+        caplog.set_level(logging.WARNING, logger="app.routers.transcribe")
+
+        sensitive_filename = "통화 녹음 01022654502_260401_172236.xyz"
+        response = client.post(
+            "/api/v1/transcribe",
+            files={"file": (sensitive_filename, b"garbage", "application/octet-stream")},
+        )
+
+        assert response.status_code == 400
+        reject_records = [r for r in caplog.records if "[reject-400]" in r.getMessage()]
+        assert len(reject_records) >= 1, "reject-400 warning 로그가 기록되지 않음"
+        for record in reject_records:
+            msg = record.getMessage()
+            assert sensitive_filename not in msg, f"파일명 PII가 로그에 노출됨: {msg}"
+            assert "01022654502" not in msg, f"전화번호 PII가 로그에 노출됨: {msg}"
+            assert "ext='xyz'" in msg, f"확장자는 기록되어야 함: {msg}"
+
+
 class TestHealthQueueField:
     """GET /api/v1/health가 큐 상태를 포함하는지 검증."""
 
