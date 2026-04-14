@@ -109,7 +109,7 @@ class ReclusterConfig:
         Environment variables:
             VOICE_DIARIZATION_WESPEAKER_RECLUSTER: true/false (default: false)
             VOICE_DIARIZATION_WESPEAKER_RECLUSTER_ENDPOINTS: comma-separated modes (default: call_recording)
-            VOICE_DIARIZATION_RECLUSTER_CONFIDENCE_THRESHOLD: float 0.0-1.0 (default: 0.15)
+            VOICE_DIARIZATION_RECLUSTER_CONFIDENCE_THRESHOLD: float 0.0-1.0 (default: 0.30)
             VOICE_DIARIZATION_RECLUSTER_MIN_WINDOW_SEC: float (default: 0.5)
             VOICE_DIARIZATION_RECLUSTER_MAX_WINDOW_SEC: float (default: 5.0)
 
@@ -129,7 +129,7 @@ class ReclusterConfig:
 
         confidence_threshold = _parse_float(
             os.environ.get("VOICE_DIARIZATION_RECLUSTER_CONFIDENCE_THRESHOLD"),
-            default=0.15,
+            default=0.30,
             param_name="VOICE_DIARIZATION_RECLUSTER_CONFIDENCE_THRESHOLD",
         )
 

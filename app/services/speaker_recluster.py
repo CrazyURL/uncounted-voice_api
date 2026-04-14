@@ -167,7 +167,7 @@ def build_embedding_windows(
 import numpy as np
 from sklearn.cluster import AgglomerativeClustering
 
-_DEFAULT_CONFIDENCE_THRESHOLD = 0.15
+_DEFAULT_CONFIDENCE_THRESHOLD = 0.30
 
 
 def recluster_speakers(
