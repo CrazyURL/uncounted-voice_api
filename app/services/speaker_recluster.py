@@ -378,3 +378,162 @@ def _canonicalize_labels(cluster_assignments: np.ndarray) -> list[str]:
             canonical[cluster_id] = "SPEAKER_01"
 
     return canonical
+
+
+# ── Phase 7 — Pipeline Integration ──────────────────────────────────────────
+
+from app.services.speaker_embedding import SpeakerEmbeddingModel, EmbeddingUnavailable
+
+
+@dataclass(frozen=True)
+class ReclusterResult:
+    """Result of maybe_recluster_speakers (Phase 7 integration hook).
+
+    Immutable frozen dataclass. All outputs are tuples (no list references).
+
+    Attributes:
+        words: tuple of word dicts (immutable copy). If changed=False or flag off,
+               identical content to input but as a tuple.
+        segments: tuple of segment dicts (immutable copy). Typically unchanged from input.
+        confidence: float [0.0, 1.0]. Clustering confidence. 0.0 if flag off or unavailable.
+        window_count: int. Number of embedding windows that were built. 0 if flag off.
+        word_indices_per_window: tuple of tuples. For each window, the word indices it contains.
+                                 Empty if flag off.
+        changed: bool. True if at least one word.speaker_id was modified.
+    """
+
+    words: tuple[dict, ...]
+    segments: tuple[dict, ...]
+    confidence: float
+    window_count: int
+    word_indices_per_window: tuple[tuple[int, ...], ...]
+    changed: bool
+
+
+def maybe_recluster_speakers(
+    audio: np.ndarray,
+    sample_rate: int,
+    words: list[dict],
+    segments: list[dict],
+    mode: str,
+    embedding_model: SpeakerEmbeddingModel | None = None,
+) -> ReclusterResult:
+    """Optional WeSpeaker reclustering hook (Phase 7: Option B Integration).
+
+    If embedding_model is None or unavailable, returns immutable copy of inputs
+    with changed=False and window_count=0 (byte-equivalent behavior).
+
+    Otherwise:
+    1. Build embedding windows from words/segments
+    2. Extract embeddings from windows
+    3. Perform 2-cluster AHC reclustering
+    4. Relabel words if confidence >= threshold
+    5. Return immutable ReclusterResult
+
+    Caller must configure ReclusterConfig separately (enable flag, endpoints,
+    confidence threshold, window size limits).
+
+    Args:
+        audio: mono float32 array, shape (N,). 16 kHz expected.
+        sample_rate: sample rate (Hz). Typically 16000.
+        words: word dicts with 'start', 'end', 'speaker_id'. NOT mutated.
+        segments: segment dicts. NOT mutated.
+        mode: endpoint mode (e.g., "call_recording") for logging/filtering.
+        embedding_model: SpeakerEmbeddingModel or None. If None, returns unchanged.
+
+    Returns:
+        ReclusterResult (frozen, immutable). Input dicts are never mutated.
+    """
+    # Phase 7a: Bypass if model unavailable or flag not set by caller
+    if embedding_model is None:
+        return ReclusterResult(
+            words=tuple(dict(w) for w in words),
+            segments=tuple(dict(s) for s in segments),
+            confidence=0.0,
+            window_count=0,
+            word_indices_per_window=(),
+            changed=False,
+        )
+
+    # Phase 7b: Extract audio duration
+    audio_duration_sec = len(audio) / float(sample_rate)
+
+    # Phase 7c: Build embedding windows
+    # Use Phase 5 defaults; caller may override via ReclusterConfig
+    windows = build_embedding_windows(
+        words=words,
+        segments=segments,
+        min_window_seconds=_DEFAULT_MIN_WINDOW_SEC,
+        max_window_seconds=_DEFAULT_MAX_WINDOW_SEC,
+        audio_duration_sec=audio_duration_sec,
+        hop_on_speaker_boundaries=True,
+    )
+
+    if not windows:
+        # No windows built → return unchanged
+        return ReclusterResult(
+            words=tuple(dict(w) for w in words),
+            segments=tuple(dict(s) for s in segments),
+            confidence=0.0,
+            window_count=0,
+            word_indices_per_window=(),
+            changed=False,
+        )
+
+    # Phase 7d: Extract embeddings per window
+    embeddings_list = []
+    window_indices_per_word = [None] * len(words)
+
+    for window_idx, window in enumerate(windows):
+        # Extract audio for this window
+        start_sample = int(window.start * sample_rate)
+        end_sample = int(window.end * sample_rate)
+        window_audio = audio[start_sample:end_sample].astype(np.float32)
+
+        if len(window_audio) == 0:
+            continue
+
+        # Extract embedding
+        embedding = embedding_model.extract_embedding(window_audio, sample_rate)
+
+        if isinstance(embedding, EmbeddingUnavailable):
+            # Embedding unavailable for this window → skip
+            continue
+
+        embeddings_list.append(embedding)
+
+        # Map word indices to this window
+        for word_idx in window.word_indices:
+            window_indices_per_word[word_idx] = window_idx
+
+    if not embeddings_list:
+        # No embeddings extracted → return unchanged
+        return ReclusterResult(
+            words=tuple(dict(w) for w in words),
+            segments=tuple(dict(s) for s in segments),
+            confidence=0.0,
+            window_count=len(windows),
+            word_indices_per_window=tuple(w.word_indices for w in windows),
+            changed=False,
+        )
+
+    # Phase 7e: Perform reclustering
+    embeddings_array = np.vstack(embeddings_list)
+    # confidence_threshold passed by caller via stt_processor config
+    # Use Phase 6 default for now; will be overridden in integration
+    updated_words, confidence, changed = recluster_speakers(
+        words=words,
+        embeddings=embeddings_array,
+        window_indices_per_word=window_indices_per_word,
+        confidence_threshold=_DEFAULT_CONFIDENCE_THRESHOLD,
+    )
+
+    # Phase 7f: Return immutable result
+    return ReclusterResult(
+        words=updated_words,
+        segments=tuple(dict(s) for s in segments),  # segments typically unchanged
+        confidence=confidence,
+        window_count=len(windows),
+        word_indices_per_window=tuple(w.word_indices for w in windows),
+        changed=changed,
+    )
