@@ -160,3 +160,221 @@ def build_embedding_windows(
             final_windows.append(EmbeddingWindow(start, end, source, word_indices))
 
     return tuple(final_windows)
+
+
+# ── Phase 6 — recluster ──────────────────────────────────────────────────
+
+import numpy as np
+from sklearn.cluster import AgglomerativeClustering
+
+_DEFAULT_CONFIDENCE_THRESHOLD = 0.15
+
+
+def recluster_speakers(
+    words: list[dict],
+    embeddings: np.ndarray,
+    window_indices_per_word: list[int | None],
+    *,
+    confidence_threshold: float = _DEFAULT_CONFIDENCE_THRESHOLD,
+) -> tuple[tuple[dict, ...], float, bool]:
+    """2-speaker AHC 재클러스터링 + 라벨 재매핑.
+
+    Takes the original word list, per-window embeddings, and a mapping from
+    word index to window index. Performs 2-cluster agglomerative hierarchical
+    clustering on the embeddings using cosine distance and average linkage.
+    Computes a confidence score (intra-cluster vs inter-cluster margin).
+    If confidence < threshold, returns original labels unchanged.
+    Otherwise, relabels each word based on its window's cluster assignment.
+
+    Args:
+        words: List of word dicts. Input mutation is forbidden.
+        embeddings: shape (W, D), L2-normalized. W = number of windows.
+        window_indices_per_word: parallel to words; None means no embedding for that word.
+        confidence_threshold: If confidence < threshold, return unchanged.
+
+    Returns:
+        (updated_words, confidence, changed)
+        - updated_words: tuple of new word dicts (copies, never mutating input)
+        - confidence: [0.0, 1.0] confidence score
+        - changed: True if any word label changed
+    """
+    if not words or embeddings.shape[0] == 0:
+        return (), 0.0, False
+
+    # Compute 2-cluster AHC on embeddings
+    cluster_labels = _cluster_two(embeddings)
+
+    # Compute confidence score
+    confidence = _compute_confidence(embeddings, cluster_labels)
+
+    # If confidence below threshold, return unchanged
+    if confidence < confidence_threshold:
+        immutable_words = tuple(dict(w) for w in words)
+        return immutable_words, confidence, False
+
+    # Build mapping: window index → cluster label (0 or 1)
+    window_to_cluster = {}
+    for window_idx, cluster_label in enumerate(cluster_labels):
+        window_to_cluster[window_idx] = cluster_label
+
+    # Canonicalize cluster ids to speaker labels
+    canonical_labels = _canonicalize_labels(cluster_labels)
+
+    # Relabel words based on window cluster assignments
+    changed = False
+    updated_words_list = []
+
+    for i, word in enumerate(words):
+        updated_word = dict(word)
+        window_idx = window_indices_per_word[i]
+
+        # If word is mapped to a window, apply cluster-based label
+        if window_idx is not None and window_idx in window_to_cluster:
+            cluster_id = window_to_cluster[window_idx]
+            new_label = canonical_labels[cluster_id]
+            if updated_word.get("speaker_id") != new_label:
+                updated_word["speaker_id"] = new_label
+                changed = True
+        # If unmapped, keep original label (no change)
+
+        updated_words_list.append(updated_word)
+
+    return tuple(updated_words_list), confidence, changed
+
+
+def _cluster_two(embeddings: np.ndarray) -> np.ndarray:
+    """Pure-numpy AHC: 2-cluster agglomerative hierarchical clustering.
+
+    Uses cosine distance and average linkage. Returns cluster labels (0 or 1).
+
+    Args:
+        embeddings: shape (N, D), L2-normalized.
+
+    Returns:
+        shape (N,), dtype int. Cluster labels (0 or 1).
+    """
+    n = embeddings.shape[0]
+
+    # Edge cases
+    if n <= 1:
+        # Single or no embedding → all cluster 0
+        return np.zeros(n, dtype=int)
+
+    if n == 2:
+        # Two embeddings → one per cluster
+        return np.array([0, 1], dtype=int)
+
+    # Compute pairwise cosine distance matrix
+    # cosine_similarity = dot product (since L2-normalized)
+    # cosine_distance = 1 - cosine_similarity
+    similarity = embeddings @ embeddings.T
+    distance = 1.0 - similarity
+
+    # Initialize: each embedding is its own cluster
+    # cluster_members[i] = list of original indices in cluster i
+    cluster_members = [[i] for i in range(n)]
+
+    # Agglomerative clustering: repeatedly merge nearest pair until 2 clusters remain
+    while len(cluster_members) > 2:
+        # Find pair of clusters with minimum average distance
+        min_dist = float('inf')
+        merge_i, merge_j = 0, 1
+
+        for i in range(len(cluster_members)):
+            for j in range(i + 1, len(cluster_members)):
+                # Average distance between cluster i and j
+                cluster_i_indices = cluster_members[i]
+                cluster_j_indices = cluster_members[j]
+
+                avg_dist = 0.0
+                for idx_i in cluster_i_indices:
+                    for idx_j in cluster_j_indices:
+                        avg_dist += distance[idx_i, idx_j]
+                avg_dist /= (len(cluster_i_indices) * len(cluster_j_indices))
+
+                if avg_dist < min_dist:
+                    min_dist = avg_dist
+                    merge_i, merge_j = i, j
+
+        # Merge cluster merge_j into cluster merge_i
+        cluster_members[merge_i].extend(cluster_members[merge_j])
+        cluster_members.pop(merge_j)
+
+    # Assign labels: cluster 0 and cluster 1
+    labels = np.zeros(n, dtype=int)
+    for cluster_id, indices_in_cluster in enumerate(cluster_members):
+        for idx in indices_in_cluster:
+            labels[idx] = cluster_id
+
+    return labels
+
+
+def _compute_confidence(embeddings: np.ndarray, labels: np.ndarray) -> float:
+    """Compute confidence score: intra vs inter-cluster margin.
+
+    margin = mean(intra_cluster_cosine_sim) - mean(inter_cluster_cosine_sim)
+    confidence = clip(margin, [0, 1])
+
+    Args:
+        embeddings: shape (N, D), L2-normalized.
+        labels: shape (N,), cluster assignments (0 or 1).
+
+    Returns:
+        float in [0.0, 1.0].
+    """
+    # Compute cosine similarities
+    similarity = embeddings @ embeddings.T
+
+    intra_sims = []
+    inter_sims = []
+
+    for i in range(len(embeddings)):
+        for j in range(i + 1, len(embeddings)):
+            sim = similarity[i, j]
+            if labels[i] == labels[j]:
+                intra_sims.append(sim)
+            else:
+                inter_sims.append(sim)
+
+    # Compute means
+    intra_mean = np.mean(intra_sims) if intra_sims else 1.0
+    inter_mean = np.mean(inter_sims) if inter_sims else 0.0
+
+    margin = intra_mean - inter_mean
+
+    # Clip to [0, 1]
+    confidence = max(0.0, min(1.0, margin))
+
+    return float(confidence)
+
+
+def _canonicalize_labels(cluster_assignments: np.ndarray) -> list[str]:
+    """Map cluster ids (0, 1) to canonical labels (SPEAKER_00, SPEAKER_01).
+
+    Deterministic: lower cluster id → SPEAKER_00. If a cluster has no first
+    occurrence or to ensure determinism, swap clusters so cluster 0 occurs first.
+
+    Args:
+        cluster_assignments: shape (N,), values 0 or 1.
+
+    Returns:
+        list of str: [label_for_cluster_0, label_for_cluster_1]
+    """
+    # Find first occurrence of each cluster
+    first_occurrence = {}
+    for i, cluster_id in enumerate(cluster_assignments):
+        if cluster_id not in first_occurrence:
+            first_occurrence[cluster_id] = i
+
+    # Sort clusters by first occurrence to ensure determinism
+    sorted_clusters = sorted(first_occurrence.keys(), key=lambda c: first_occurrence[c])
+
+    # Assign labels: first cluster → SPEAKER_00, second → SPEAKER_01
+    canonical = [""] * 2
+    for position, cluster_id in enumerate(sorted_clusters):
+        if position == 0:
+            canonical[cluster_id] = "SPEAKER_00"
+        elif position == 1:
+            canonical[cluster_id] = "SPEAKER_01"
+
+    return canonical
