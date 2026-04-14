@@ -23,7 +23,7 @@ RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", "/dev/shm/stt-results"))
 
 # 업로드 제한
 MAX_UPLOAD_SIZE = int(os.environ.get("MAX_UPLOAD_SIZE", str(500 * 1024 * 1024)))
-ALLOWED_EXTENSIONS = {"wav", "mp3", "m4a", "ogg", "flac", "webm", "mp4"}
+ALLOWED_EXTENSIONS = {"wav", "mp3", "m4a", "ogg", "flac", "webm", "mp4", "amr", "3gp"}
 
 # 큐 백프레셔: pending + processing 합산이 이 값 이상이면 POST /transcribe는 503 반환
 MAX_ACTIVE_JOBS = int(os.environ.get("MAX_ACTIVE_JOBS", "5"))
