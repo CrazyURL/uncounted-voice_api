@@ -1,364 +1,364 @@
-"""Tests for WeSpeaker ONNX embedding model (Phase 4).
+"""Tests for pyannote-based speaker embedding model (Phase 4, Option B).
 
 Tests validate the SpeakerEmbeddingModel class:
 - Lazy loading on first extract_embedding call
-- ONNX session creation with provider selection
+- pyannote.audio.Model.from_pretrained 호출 + device 배치
 - Audio preprocessing (mono mixdown, resample, float32 normalize)
-- Output dimension inference from model metadata
 - L2 normalization of embeddings
-- Handling of unavailable model (env var unset, file missing, import failed)
-- Audio length validation (minimum duration)
+- Handling of unavailable model (from_pretrained 실패, import 실패, 오디오 짧음)
 
-Uses fakes for onnxruntime to avoid requiring ONNX installations in test environments.
+Uses fakes for pyannote.audio via sys.modules injection to avoid downloading
+the real wespeaker model in test environments.
 """
 
-import os
 import sys
+import types
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+import torch
+
+
+def _install_fake_pyannote(monkeypatch, fake_model_factory):
+    """Inject a fake `pyannote.audio` module that exposes `Model.from_pretrained`.
+
+    `fake_model_factory(repo, **kwargs)` should return an object that responds
+    to `.eval()`, `.to(device)`, and `__call__(tensor)`.
+    """
+    fake_pkg = types.ModuleType("pyannote")
+    fake_audio = types.ModuleType("pyannote.audio")
+
+    class FakeModelClass:
+        @staticmethod
+        def from_pretrained(repo, **kwargs):
+            return fake_model_factory(repo, **kwargs)
+
+    fake_audio.Model = FakeModelClass
+    fake_pkg.audio = fake_audio
+    monkeypatch.setitem(sys.modules, "pyannote", fake_pkg)
+    monkeypatch.setitem(sys.modules, "pyannote.audio", fake_audio)
+
+
+def _reload_module():
+    """Drop the cached speaker_embedding module so the next import re-binds
+    the freshly-faked `pyannote.audio`."""
+    sys.modules.pop("app.services.speaker_embedding", None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_embedding_module():
+    yield
+    sys.modules.pop("app.services.speaker_embedding", None)
 
 
 @pytest.mark.unit
 class TestSpeakerEmbeddingModelInit:
-    """Tests for SpeakerEmbeddingModel.__init__()."""
-
     def test_init_does_not_load_model(self, monkeypatch):
-        """__init__ should not trigger lazy load."""
-        monkeypatch.setenv("VOICE_DIARIZATION_WESPEAKER_MODEL_PATH", "/nonexistent.onnx")
+        load_calls = []
+
+        def factory(repo, **kwargs):
+            load_calls.append(repo)
+            return MagicMock()
+
+        _install_fake_pyannote(monkeypatch, factory)
+        _reload_module()
 
         from app.services.speaker_embedding import SpeakerEmbeddingModel
 
-        model = SpeakerEmbeddingModel()
-        assert model is not None  # Just verify construction succeeds
+        SpeakerEmbeddingModel()
+        assert load_calls == []  # lazy, not loaded yet
 
 
 @pytest.mark.unit
-class TestMissingModelPath:
-    """Tests for missing or invalid VOICE_DIARIZATION_WESPEAKER_MODEL_PATH."""
+class TestModelLoadFailure:
+    def test_from_pretrained_failure_returns_unavailable(self, monkeypatch):
+        def factory(repo, **kwargs):
+            raise RuntimeError("no such repo")
 
-    def test_missing_model_path_returns_unavailable(self, monkeypatch):
-        """Unset VOICE_DIARIZATION_WESPEAKER_MODEL_PATH → EmbeddingUnavailable('model_missing')."""
-        monkeypatch.delenv("VOICE_DIARIZATION_WESPEAKER_MODEL_PATH", raising=False)
+        _install_fake_pyannote(monkeypatch, factory)
+        _reload_module()
 
-        from app.services.speaker_embedding import SpeakerEmbeddingModel, EmbeddingUnavailable
+        from app.services.speaker_embedding import (
+            EmbeddingUnavailable,
+            SpeakerEmbeddingModel,
+        )
 
         model = SpeakerEmbeddingModel()
-        audio = np.random.randn(16000).astype(np.float32)  # 1 second @ 16kHz
+        audio = np.zeros(16000, dtype=np.float32)
         result = model.extract_embedding(audio, 16000)
-
         assert isinstance(result, EmbeddingUnavailable)
         assert result.reason == "model_missing"
 
-    def test_invalid_model_path_returns_unavailable(self, monkeypatch):
-        """Non-existent model file → EmbeddingUnavailable('model_missing')."""
-        monkeypatch.setenv("VOICE_DIARIZATION_WESPEAKER_MODEL_PATH", "/nonexistent/path.onnx")
+    def test_empty_repo_returns_unavailable(self, monkeypatch):
+        def factory(repo, **kwargs):
+            return MagicMock()
 
-        from app.services.speaker_embedding import SpeakerEmbeddingModel, EmbeddingUnavailable
+        _install_fake_pyannote(monkeypatch, factory)
+        monkeypatch.setenv("VOICE_DIARIZATION_WESPEAKER_REPO", "")
+        _reload_module()
+
+        from app.services.speaker_embedding import (
+            EmbeddingUnavailable,
+            SpeakerEmbeddingModel,
+        )
 
         model = SpeakerEmbeddingModel()
-        audio = np.random.randn(16000).astype(np.float32)
+        audio = np.zeros(16000, dtype=np.float32)
         result = model.extract_embedding(audio, 16000)
-
         assert isinstance(result, EmbeddingUnavailable)
         assert result.reason == "model_missing"
 
 
 @pytest.mark.unit
-class TestONNXRuntimeProvider:
-    """Tests for execution provider selection."""
+class TestDeviceSelection:
+    def _make_fake_model(self, captured):
+        fake = MagicMock()
+        fake.eval = MagicMock(return_value=fake)
 
-    def test_default_provider_is_cpu(self, monkeypatch, tmp_path):
-        """Default VOICE_DIARIZATION_EMBEDDING_PROVIDER=cpu → CPUExecutionProvider."""
-        # Create a fake onnxruntime module
-        fake_onnx = MagicMock()
-        captured_providers = []
+        def fake_to(device):
+            captured["device"] = device
+            return fake
 
-        class FakeSession:
-            def __init__(self, path, sess_options=None, providers=None):
-                self.path = path
-                self.providers = providers if providers is not None else []
-                captured_providers.append(self.providers)
+        fake.to = fake_to
 
-            def get_outputs(self):
-                return [MagicMock(shape=[1, 192])]
+        def fake_call(tensor):
+            return torch.zeros((1, 4), dtype=torch.float32)
 
-            def run(self, output_names, input_feed):
-                return [np.array([[0.6, 0.8] + [0.0] * 190], dtype=np.float32)]
+        fake.side_effect = fake_call
+        return fake
 
-        fake_onnx.InferenceSession = FakeSession
-        fake_onnx.SessionOptions = MagicMock
+    def test_default_provider_is_cpu(self, monkeypatch):
+        captured = {}
 
-        # Inject fake module
-        monkeypatch.setitem(sys.modules, "onnxruntime", fake_onnx)
+        def factory(repo, **kwargs):
+            return self._make_fake_model(captured)
 
-        # Create a dummy model file
-        model_path = tmp_path / "test.onnx"
-        model_path.write_bytes(b"fake model")
-
-        monkeypatch.setenv("VOICE_DIARIZATION_WESPEAKER_MODEL_PATH", str(model_path))
+        _install_fake_pyannote(monkeypatch, factory)
         monkeypatch.delenv("VOICE_DIARIZATION_EMBEDDING_PROVIDER", raising=False)
+        _reload_module()
 
         from app.services.speaker_embedding import SpeakerEmbeddingModel
 
         model = SpeakerEmbeddingModel()
-        audio = np.random.randn(16000).astype(np.float32)
-        result = model.extract_embedding(audio, 16000)
+        audio = np.zeros(16000, dtype=np.float32)
+        model.extract_embedding(audio, 16000)
+        assert captured["device"] == "cpu"
 
-        assert len(captured_providers) > 0
-        providers_used = captured_providers[0]
-        assert "CPUExecutionProvider" in providers_used
+    def test_cuda_provider_uses_cuda_when_available(self, monkeypatch):
+        captured = {}
 
-    def test_provider_override_via_env(self, monkeypatch, tmp_path):
-        """VOICE_DIARIZATION_EMBEDDING_PROVIDER=cuda → includes CUDAExecutionProvider."""
-        fake_onnx = MagicMock()
-        captured_providers = []
+        def factory(repo, **kwargs):
+            return self._make_fake_model(captured)
 
-        class FakeSession:
-            def __init__(self, path, sess_options=None, providers=None):
-                self.path = path
-                self.providers = providers if providers is not None else []
-                captured_providers.append(self.providers)
-
-            def get_outputs(self):
-                return [MagicMock(shape=[1, 192])]
-
-            def run(self, output_names, input_feed):
-                return [np.array([[0.6, 0.8] + [0.0] * 190], dtype=np.float32)]
-
-        fake_onnx.InferenceSession = FakeSession
-        fake_onnx.SessionOptions = MagicMock
-
-        monkeypatch.setitem(sys.modules, "onnxruntime", fake_onnx)
-
-        model_path = tmp_path / "test.onnx"
-        model_path.write_bytes(b"fake model")
-
-        monkeypatch.setenv("VOICE_DIARIZATION_WESPEAKER_MODEL_PATH", str(model_path))
+        _install_fake_pyannote(monkeypatch, factory)
         monkeypatch.setenv("VOICE_DIARIZATION_EMBEDDING_PROVIDER", "cuda")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        _reload_module()
 
         from app.services.speaker_embedding import SpeakerEmbeddingModel
 
         model = SpeakerEmbeddingModel()
-        audio = np.random.randn(16000).astype(np.float32)
-        result = model.extract_embedding(audio, 16000)
+        audio = np.zeros(16000, dtype=np.float32)
+        model.extract_embedding(audio, 16000)
+        assert captured["device"] == "cuda"
 
-        assert len(captured_providers) > 0
-        providers_used = captured_providers[0]
-        assert "CUDAExecutionProvider" in providers_used
+    def test_cuda_provider_falls_back_when_unavailable(self, monkeypatch):
+        captured = {}
+
+        def factory(repo, **kwargs):
+            return self._make_fake_model(captured)
+
+        _install_fake_pyannote(monkeypatch, factory)
+        monkeypatch.setenv("VOICE_DIARIZATION_EMBEDDING_PROVIDER", "cuda")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        _reload_module()
+
+        from app.services.speaker_embedding import SpeakerEmbeddingModel
+
+        model = SpeakerEmbeddingModel()
+        audio = np.zeros(16000, dtype=np.float32)
+        model.extract_embedding(audio, 16000)
+        assert captured["device"] == "cpu"
 
 
 @pytest.mark.unit
-class TestAudioNormalization:
-    """Tests for audio preprocessing (mono, resample, float32)."""
+class TestAudioPreprocessing:
+    def test_stereo_int16_converted_to_mono_float32(self, monkeypatch):
+        captured = {}
 
-    def test_input_normalization_mono_float32(self, monkeypatch, tmp_path):
-        """Stereo int16 → mono float32 before session.run()."""
-        fake_onnx = MagicMock()
-        captured_inputs = []
+        def fake_call(tensor):
+            captured["shape"] = tuple(tensor.shape)
+            captured["dtype"] = tensor.dtype
+            return torch.tensor([[0.6, 0.8]], dtype=torch.float32)
 
-        class FakeSession:
-            def __init__(self, path, sess_options=None, providers=None):
-                pass
+        def factory(repo, **kwargs):
+            fake = MagicMock()
+            fake.eval = MagicMock(return_value=fake)
+            fake.to = MagicMock(return_value=fake)
+            fake.side_effect = fake_call
+            return fake
 
-            def get_inputs(self):
-                mock_input = MagicMock()
-                mock_input.name = "audio_input"
-                return [mock_input]
-
-            def get_outputs(self):
-                mock_output = MagicMock()
-                mock_output.name = "embeddings"
-                mock_output.shape = [1, 192]
-                return [mock_output]
-
-            def run(self, output_names, input_feed):
-                # Capture the input for validation
-                for key, val in input_feed.items():
-                    captured_inputs.append((key, val.copy() if hasattr(val, "copy") else val))
-                return [np.array([[0.6, 0.8] + [0.0] * 190], dtype=np.float32)]
-
-        fake_onnx.InferenceSession = FakeSession
-        fake_onnx.SessionOptions = MagicMock
-
-        monkeypatch.setitem(sys.modules, "onnxruntime", fake_onnx)
-
-        model_path = tmp_path / "test.onnx"
-        model_path.write_bytes(b"fake model")
-
-        monkeypatch.setenv("VOICE_DIARIZATION_WESPEAKER_MODEL_PATH", str(model_path))
-
-        from app.services.speaker_embedding import SpeakerEmbeddingModel
-
-        # Test stereo int16 input
-        model = SpeakerEmbeddingModel()
-        stereo_audio = np.random.randint(-32768, 32767, (2, 16000), dtype=np.int16)
-        result = model.extract_embedding(stereo_audio, 16000)
-
-        assert len(captured_inputs) > 0
-        _, input_array = captured_inputs[0]
-        # Should be 2D [1, N] mono float32 after reshape in code
-        assert input_array.ndim == 2
-        assert input_array.dtype == np.float32
-        assert input_array.shape[0] == 1
-
-
-@pytest.mark.unit
-class TestOutputDimensionInference:
-    """Tests for output dimension inference from session metadata."""
-
-    def test_output_dimension_inferred_from_session(self, monkeypatch, tmp_path):
-        """Output dimension read from session.get_outputs()[0].shape, not hardcoded."""
-        fake_onnx = MagicMock()
-        test_dim = 192
-
-        class FakeSession:
-            def __init__(self, path, sess_options=None, providers=None):
-                pass
-
-            def get_inputs(self):
-                mock_input = MagicMock()
-                mock_input.name = "audio_input"
-                return [mock_input]
-
-            def get_outputs(self):
-                return [MagicMock(shape=[1, test_dim])]
-
-            def run(self, output_names, input_feed):
-                # Return embedding with the inferred dimension
-                return [np.zeros((1, test_dim), dtype=np.float32)]
-
-        fake_onnx.InferenceSession = FakeSession
-        fake_onnx.SessionOptions = MagicMock
-
-        monkeypatch.setitem(sys.modules, "onnxruntime", fake_onnx)
-
-        model_path = tmp_path / "test.onnx"
-        model_path.write_bytes(b"fake model")
-
-        monkeypatch.setenv("VOICE_DIARIZATION_WESPEAKER_MODEL_PATH", str(model_path))
+        _install_fake_pyannote(monkeypatch, factory)
+        _reload_module()
 
         from app.services.speaker_embedding import SpeakerEmbeddingModel
 
         model = SpeakerEmbeddingModel()
-        audio = np.random.randn(16000).astype(np.float32)
-        result = model.extract_embedding(audio, 16000)
+        stereo = np.random.randint(-32768, 32767, (2, 16000), dtype=np.int16)
+        result = model.extract_embedding(stereo, 16000)
 
-        # Result should be 1D with shape (test_dim,) or 2D (1, test_dim) — depends on implementation
         assert isinstance(result, np.ndarray)
-        if result.ndim == 1:
-            assert result.shape == (test_dim,)
-        else:
-            assert result.shape == (1, test_dim)
+        # (batch=1, channels=1, samples)
+        assert captured["shape"][0] == 1
+        assert captured["shape"][1] == 1
+        assert captured["dtype"] == torch.float32
+
+    def test_resample_from_8k_to_16k(self, monkeypatch):
+        captured = {}
+
+        def fake_call(tensor):
+            captured["samples"] = tensor.shape[-1]
+            return torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+
+        def factory(repo, **kwargs):
+            fake = MagicMock()
+            fake.eval = MagicMock(return_value=fake)
+            fake.to = MagicMock(return_value=fake)
+            fake.side_effect = fake_call
+            return fake
+
+        _install_fake_pyannote(monkeypatch, factory)
+        _reload_module()
+
+        from app.services.speaker_embedding import SpeakerEmbeddingModel
+
+        model = SpeakerEmbeddingModel()
+        audio = np.zeros(8000, dtype=np.float32)  # 1s @ 8kHz
+        model.extract_embedding(audio, 8000)
+        # 1s @ 16kHz target → ~16000 samples
+        assert 15000 <= captured["samples"] <= 17000
 
 
 @pytest.mark.unit
 class TestL2Normalization:
-    """Tests for L2 normalization of output embedding."""
+    def test_output_is_l2_normalized(self, monkeypatch):
+        def fake_call(tensor):
+            # Unnormalized [3, 4] → L2 norm = 5.0
+            return torch.tensor([[3.0, 4.0]], dtype=torch.float32)
 
-    def test_output_is_l2_normalized(self, monkeypatch, tmp_path):
-        """Output embedding has L2 norm ≈ 1.0 (within 1e-6)."""
-        fake_onnx = MagicMock()
+        def factory(repo, **kwargs):
+            fake = MagicMock()
+            fake.eval = MagicMock(return_value=fake)
+            fake.to = MagicMock(return_value=fake)
+            fake.side_effect = fake_call
+            return fake
 
-        class FakeSession:
-            def __init__(self, path, sess_options=None, providers=None):
-                pass
-
-            def get_inputs(self):
-                mock_input = MagicMock()
-                mock_input.name = "audio_input"
-                return [mock_input]
-
-            def get_outputs(self):
-                return [MagicMock(shape=[1, 2])]
-
-            def run(self, output_names, input_feed):
-                # Return [3, 4] which has L2 norm = 5.0 (not normalized)
-                return [np.array([[3.0, 4.0]], dtype=np.float32)]
-
-        fake_onnx.InferenceSession = FakeSession
-        fake_onnx.SessionOptions = MagicMock
-
-        monkeypatch.setitem(sys.modules, "onnxruntime", fake_onnx)
-
-        model_path = tmp_path / "test.onnx"
-        model_path.write_bytes(b"fake model")
-
-        monkeypatch.setenv("VOICE_DIARIZATION_WESPEAKER_MODEL_PATH", str(model_path))
+        _install_fake_pyannote(monkeypatch, factory)
+        _reload_module()
 
         from app.services.speaker_embedding import SpeakerEmbeddingModel
 
         model = SpeakerEmbeddingModel()
-        audio = np.random.randn(16000).astype(np.float32)
+        audio = np.zeros(16000, dtype=np.float32)
         result = model.extract_embedding(audio, 16000)
 
-        # Compute L2 norm
-        if result.ndim == 2:
-            result = result.squeeze()
-        norm = np.linalg.norm(result)
-        assert abs(norm - 1.0) < 1e-6, f"Expected L2 norm ≈ 1.0, got {norm}"
+        assert isinstance(result, np.ndarray)
+        norm = float(np.linalg.norm(result))
+        assert abs(norm - 1.0) < 1e-5
 
 
 @pytest.mark.unit
 class TestAudioTooShort:
-    """Tests for audio length validation."""
+    def test_audio_too_short_returns_unavailable(self, monkeypatch):
+        def factory(repo, **kwargs):
+            return MagicMock()
 
-    def test_audio_too_short_returns_unavailable(self, monkeypatch, tmp_path):
-        """Audio < 0.5 seconds → EmbeddingUnavailable('audio_too_short')."""
-        fake_onnx = MagicMock()
+        _install_fake_pyannote(monkeypatch, factory)
+        _reload_module()
 
-        class FakeSession:
-            def __init__(self, path, sess_options=None, providers=None):
-                pass
-
-            def get_outputs(self):
-                return [MagicMock(shape=[1, 192])]
-
-            def run(self, output_names, input_feed):
-                return [np.zeros((1, 192), dtype=np.float32)]
-
-        fake_onnx.InferenceSession = FakeSession
-        fake_onnx.SessionOptions = MagicMock
-
-        monkeypatch.setitem(sys.modules, "onnxruntime", fake_onnx)
-
-        model_path = tmp_path / "test.onnx"
-        model_path.write_bytes(b"fake model")
-
-        monkeypatch.setenv("VOICE_DIARIZATION_WESPEAKER_MODEL_PATH", str(model_path))
-
-        from app.services.speaker_embedding import SpeakerEmbeddingModel, EmbeddingUnavailable
+        from app.services.speaker_embedding import (
+            EmbeddingUnavailable,
+            SpeakerEmbeddingModel,
+        )
 
         model = SpeakerEmbeddingModel()
-        # 50 samples @ 16kHz = 0.003 seconds (way less than 0.5s)
+        # 50 samples @ 16kHz ≈ 3ms
         short_audio = np.random.randn(50).astype(np.float32)
         result = model.extract_embedding(short_audio, 16000)
-
         assert isinstance(result, EmbeddingUnavailable)
         assert result.reason == "audio_too_short"
 
 
 @pytest.mark.unit
-class TestONNXRuntimeImportFailure:
-    """Tests for handling onnxruntime import failure."""
+class TestImportFailure:
+    def test_pyannote_import_failure_returns_unavailable(self, monkeypatch):
+        # Force ImportError by setting pyannote.audio to None
+        monkeypatch.setitem(sys.modules, "pyannote", None)
+        monkeypatch.setitem(sys.modules, "pyannote.audio", None)
+        _reload_module()
 
-    def test_onnxruntime_import_failure_handled(self, monkeypatch, tmp_path):
-        """onnxruntime unavailable (ImportError) → EmbeddingUnavailable('import_failed')."""
-        # Set onnxruntime to None to simulate import failure
-        monkeypatch.setitem(sys.modules, "onnxruntime", None)
-
-        model_path = tmp_path / "test.onnx"
-        model_path.write_bytes(b"fake model")
-
-        monkeypatch.setenv("VOICE_DIARIZATION_WESPEAKER_MODEL_PATH", str(model_path))
-
-        # Import after setting sys.modules
-        from app.services.speaker_embedding import SpeakerEmbeddingModel, EmbeddingUnavailable
+        from app.services.speaker_embedding import (
+            EmbeddingUnavailable,
+            SpeakerEmbeddingModel,
+        )
 
         model = SpeakerEmbeddingModel()
-        audio = np.random.randn(16000).astype(np.float32)
+        audio = np.zeros(16000, dtype=np.float32)
         result = model.extract_embedding(audio, 16000)
-
         assert isinstance(result, EmbeddingUnavailable)
         assert result.reason == "import_failed"
+
+
+@pytest.mark.unit
+class TestForwardFailure:
+    def test_forward_exception_returns_extraction_failed(self, monkeypatch):
+        def fake_call(tensor):
+            raise RuntimeError("boom")
+
+        def factory(repo, **kwargs):
+            fake = MagicMock()
+            fake.eval = MagicMock(return_value=fake)
+            fake.to = MagicMock(return_value=fake)
+            fake.side_effect = fake_call
+            return fake
+
+        _install_fake_pyannote(monkeypatch, factory)
+        _reload_module()
+
+        from app.services.speaker_embedding import (
+            EmbeddingUnavailable,
+            SpeakerEmbeddingModel,
+        )
+
+        model = SpeakerEmbeddingModel()
+        audio = np.zeros(16000, dtype=np.float32)
+        result = model.extract_embedding(audio, 16000)
+        assert isinstance(result, EmbeddingUnavailable)
+        assert result.reason == "extraction_failed"
+
+
+@pytest.mark.unit
+class TestLazyLoadSingleton:
+    def test_model_loaded_once(self, monkeypatch):
+        call_count = {"n": 0}
+
+        def factory(repo, **kwargs):
+            call_count["n"] += 1
+            fake = MagicMock()
+            fake.eval = MagicMock(return_value=fake)
+            fake.to = MagicMock(return_value=fake)
+            fake.side_effect = lambda t: torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+            return fake
+
+        _install_fake_pyannote(monkeypatch, factory)
+        _reload_module()
+
+        from app.services.speaker_embedding import SpeakerEmbeddingModel
+
+        model = SpeakerEmbeddingModel()
+        audio = np.zeros(16000, dtype=np.float32)
+        model.extract_embedding(audio, 16000)
+        model.extract_embedding(audio, 16000)
+        model.extract_embedding(audio, 16000)
+        assert call_count["n"] == 1
