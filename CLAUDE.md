@@ -29,7 +29,7 @@ app/
 ├── stt_processor.py     # STT 파이프라인 (핵심)
 ├── pii_masker.py        # PII 마스킹
 ├── routers/             # health, transcribe
-├── services/            # audio_preprocessor, audio_splitter, pii_service, utterance_segmenter, whisperx_service
+├── services/            # audio_preprocessor, audio_splitter, pii_service, utterance_segmenter, whisperx_service, speaker_embedding, speaker_recluster (Phase 4-7, dormant)
 ├── models/schemas.py    # Pydantic 스키마
 └── core/                # job_store (TTL 1h, max 100), exceptions
 tests/                   # pytest

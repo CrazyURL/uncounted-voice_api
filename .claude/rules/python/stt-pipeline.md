@@ -26,6 +26,11 @@ Upload → Preprocess (gain → denoise → dedup → silence) → GPU Inference
 | `utterance_segmenter.py` | Word-level utterance boundary detection |
 | `audio_splitter.py` | Per-utterance/per-speaker WAV extraction |
 | `pii_masker.py` | Korean PII regex masking (9 types + optional name masking) |
+| `speaker_embedding.py` | pyannote/wespeaker 임베딩 추출 (Phase 4, dormant flag) |
+| `speaker_recluster.py` | 2-cluster AHC 재클러스터링 + confidence gate (Phase 5-7, dormant) |
+| `recluster_config.py` | Option B 재클러스터링 env var 파싱 (기본 off) |
+| `diarization_config.py` | Option D force_two_speakers 파라미터 주입 설정 |
+| `diarization_metrics.py` | 2-화자 permutation-invariant word 정확도 메트릭 |
 
 ## GPU Singleton Pattern
 
