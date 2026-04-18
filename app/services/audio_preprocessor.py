@@ -401,6 +401,52 @@ def normalize_gain(audio: np.ndarray) -> np.ndarray:
     return np.clip(audio * gain, -1.0, 1.0).astype(audio.dtype)
 
 
+def local_normalize_gain(audio: np.ndarray, sr: int) -> np.ndarray:
+    """슬라이딩 윈도우 로컬 게인 정규화.
+
+    글로벌 정규화로 부스트되지 않는 조용한 구간(끝부분 등)을 VAD가 감지할 수 있도록
+    500ms 윈도우 단위로 독립적으로 부스트한다. 윈도우 간 선형 보간으로 부드럽게 연결.
+    이미 충분히 큰 구간(gain ≤ 1.0)은 건드리지 않는다.
+    """
+    if len(audio) == 0:
+        return audio
+
+    window_samples = int(0.5 * sr)   # 500ms 윈도우
+    hop_samples = int(0.1 * sr)      # 100ms hop
+
+    if len(audio) < window_samples:
+        return audio
+
+    positions: list[int] = []
+    gains: list[float] = []
+
+    for start in range(0, len(audio) - window_samples + 1, hop_samples):
+        segment = audio[start:start + window_samples]
+        rms = float(np.sqrt(np.mean(segment ** 2)))
+        center = start + window_samples // 2
+
+        if rms > 1e-7:
+            g = min(TARGET_GAIN_RMS / rms, config.LOCAL_MAX_GAIN_X)
+            g = max(g, 1.0)  # 부스트만, 감쇠 없음
+        else:
+            g = 1.0
+
+        positions.append(center)
+        gains.append(g)
+
+    if not gains:
+        return audio
+
+    # 윈도우 중심 간 선형 보간으로 연속 gain curve 생성
+    gain_curve = np.interp(np.arange(len(audio)), positions, gains).astype(np.float32)
+
+    boosted_count = int(np.sum(gain_curve > 1.01))
+    if boosted_count > 0:
+        logger.info("로컬 게인 정규화: %d 샘플(%.2fs) 부스트", boosted_count, boosted_count / sr)
+
+    return np.clip(audio * gain_curve, -1.0, 1.0).astype(audio.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -427,6 +473,11 @@ def preprocess(
         result = normalize_gain(result)
         timings["gain"] = time.time() - t
         applied.append("gain")
+
+        t = time.time()
+        result = local_normalize_gain(result, sr)
+        timings["local_gain"] = time.time() - t
+        applied.append("local_gain")
 
     # 인자 denoise_enabled가 명시되면 우선, 없으면 config 사용
     denoise_on = denoise_enabled if denoise_enabled is not None else config.PREPROCESS_DENOISE_ENABLED

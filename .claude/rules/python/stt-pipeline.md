@@ -26,11 +26,6 @@ Upload → Preprocess (gain → denoise → dedup → silence) → GPU Inference
 | `utterance_segmenter.py` | Word-level utterance boundary detection |
 | `audio_splitter.py` | Per-utterance/per-speaker WAV extraction |
 | `pii_masker.py` | Korean PII regex masking (9 types + optional name masking) |
-| `speaker_embedding.py` | pyannote/wespeaker 임베딩 추출 (Phase 4, dormant flag) |
-| `speaker_recluster.py` | 2-cluster AHC 재클러스터링 + confidence gate (Phase 5-7, dormant) |
-| `recluster_config.py` | Option B 재클러스터링 env var 파싱 (기본 off) |
-| `diarization_config.py` | Option D force_two_speakers 파라미터 주입 설정 |
-| `diarization_metrics.py` | 2-화자 permutation-invariant word 정확도 메트릭 |
 
 ## GPU Singleton Pattern
 
@@ -56,20 +51,6 @@ Files longer than `CHUNK_THRESHOLD_SEC` (default 1h) trigger chunked processing:
 - `JobStore` (in-memory, thread-safe) tracks status: pending → processing → completed/failed
 - Client polls `GET /jobs/{task_id}` (recommended 1-2s interval)
 - Completed jobs auto-expire after 1h, max 100 stored
-
-## Queue Backpressure (503)
-
-- `JobStore.active_count()`이 `MAX_ACTIVE_JOBS`(기본 5) 이상이면 `POST /transcribe`는 503 반환
-- 응답에 `Retry-After: 30` 헤더 + JSON body `detail.retry_after_sec: 30` 동시 포함
-- 목적: 긴 세션이 GPU Semaphore 점유 중일 때 짧은 세션이 무한 큐잉되어 클라이언트 폴링 타임아웃 루프에 빠지는 것을 방지
-- `GET /health` 응답에 `queue: {active, max_active, utilization_pct}` 필드로 현재 큐 포화도 관측 가능
-- 관련 이슈 문서: `uncounted-docs/voice-api/큐_병목_및_폴링_타임아웃_이슈.md`
-
-## Test Environment
-
-- `TESTING=1` 환경변수가 설정되면 lifespan이 `whisperx_service.load_models()`를 스킵
-- 이유: 운영 서버가 이미 GPU를 점유 중일 때 pytest의 TestClient가 lifespan으로 모델을 재로딩 시도 → CUDA OOM 방지
-- `tests/conftest.py`가 import 시점에 `os.environ.setdefault("TESTING", "1")` 자동 설정
 
 ## Audio File Storage
 

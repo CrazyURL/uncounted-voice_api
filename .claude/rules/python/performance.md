@@ -32,17 +32,6 @@ DeepFilterNet runs as a persistent daemon subprocess (CPU-only) to avoid CUDA al
 - `torch.cuda.empty_cache()` inside GPU lock's `finally` block
 - Startup cleanup: removes stale temp files from previous sessions
 
-## Chunked Mode Response Contract
-
-원본 길이 ≥ `CHUNK_THRESHOLD_SEC`(기본 1h) 파일은 청크 모드로 처리되며, 응답에서 다음과 같이 동작한다:
-
-- `chunked_processing: true`
-- `utterances`: **청크 모드에서도 제공**. 각 청크가 메모리에 있는 동안 chunk-local 좌표로 발화 경계를 산출한 뒤 `extract_utterance_audio_local`로 WAV를 즉시 생성하고, 메타데이터 타임스탬프만 누적 offset으로 globalize한다. 청크 경계에 걸치는 발화는 경계에서 강제 분리될 수 있다.
-- `speaker_audio`: **청크 모드에서는 `null` 고정**. 화자별 WAV는 전체 오디오 배열이 필요해 OOM 제약 때문에 제공하지 않는다.
-- `_audio_files`: `utterance_XXX.wav`만 포함 (speaker_XX.wav 없음)
-
-관련 이슈 문서: `uncounted-docs/voice-api/청크모드_WAV_미생성_이슈.md`
-
 ## Critical Constraints
 
 - **Single worker only** (`--workers 1`): GPU models are global singletons, not fork-safe

@@ -207,6 +207,39 @@ class TestCaseCBackchannelGuard:
         assert any("같이" in u.transcript_text for u in spk01)
 
 
+class TestCascadeMergeGuard:
+    """Regression — 같은 화자 단기 세그먼트가 무제한 누적되어 MAX_UTTERANCE_SEC에 근접하는 버그.
+
+    재현 케이스: utt_34c810c30650d12e_008.wav (23.81s)
+    원인: _merge_short_utterances에서 same-speaker 병합 시 크기 상한 체크 없음.
+    _split_by_boundaries가 0.6s silence로 6개의 ~4s 세그먼트를 만들어도,
+    _merge_short_utterances가 전부 합쳐 ~24s 단일 utterance로 만들어 버림.
+    """
+
+    def test_same_speaker_cascade_merge_respects_max_utterance_sec(self):
+        # Arrange — ~4s짜리 세그먼트 6개 (같은 화자), 0.6s 침묵으로 분리
+        # 각 세그먼트: 8단어 × 0.45s = 3.6s (< MIN_UTTERANCE_SEC=5.0)
+        # 침묵: 0.6s (> SILENCE_GAP_SEC=0.5 → _split_by_boundaries가 경계 생성)
+        # 수정 전: _merge_short_utterances가 동일 화자 6개를 모두 누적 → ~24s
+        # 수정 후: MAX_UTTERANCE_SEC(30s) 이하를 보장하며 분리
+        words = []
+        t = 0.0
+        for seg in range(6):
+            for w in range(8):
+                words.append(_word(f"w{seg}_{w}", t, t + 0.45, "SPEAKER_0"))
+                t += 0.5  # 단어 간 50ms gap 포함
+            t += 0.6  # 세그먼트 간 600ms (> SILENCE_GAP_SEC → 경계 생성)
+
+        result = segment(words, t)
+
+        # 6개 세그먼트(각 3.95s)가 모두 병합되면 1개(26.95s)가 된다.
+        # 수정 후에는 last가 MIN_UTTERANCE_SEC(5s) 이상이면 더 이상 병합 안 하므로
+        # 최소 2개 이상의 utterance가 남아야 한다.
+        assert len(result) >= 2, (
+            f"cascade merge 버그: {len(result)}개 — 6개 세그먼트가 1개로 뭉쳐짐"
+        )
+
+
 class TestPadding:
     def test_applies_padding(self):
         words = [_word("hello", 1.0, 2.0)]
@@ -223,3 +256,98 @@ class TestPadding:
         words = [_word("hello", 4.8, 5.0)]
         result = segment(words, 5.0)
         assert result[0].padded_end_sec <= 5.0
+
+
+# ---------------------------------------------------------------------------
+# TestFixHangingWords
+# ---------------------------------------------------------------------------
+
+class TestFixHangingWords:
+    """_fix_hanging_words: 발화 끝에 고립된 단어를 다음 발화 앞으로 이동."""
+
+    def test_moves_hanging_word_to_next_utterance(self, monkeypatch):
+        # 재현: "혹시나 [지금] | DJI 이메일..." → "혹시나 | [지금] DJI 이메일..."
+        # gap("혹시나"→"지금") = 0.38s ≥ HANGING_WORD_GAP_SEC=0.3
+        # gap("지금"→"DJI") = 0.52s ≥ SILENCE_GAP_SEC=0.5
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "HANGING_WORD_GAP_SEC", 0.3)
+        monkeypatch.setattr(cfg, "SILENCE_GAP_SEC", 0.5)
+        monkeypatch.setattr(cfg, "MIN_UTTERANCE_SEC", 1.0)  # 병합 방지
+        monkeypatch.setattr(cfg, "MAX_UTTERANCE_SEC", 30.0)
+
+        words = [
+            _word("지금",    0.13, 0.27),
+            _word("쓰는",    0.49, 0.69),
+            _word("혹시나",  1.19, 2.67),
+            _word("지금",    3.05, 3.41),  # hanging — gap_before=0.38s
+            _word("DJI",    3.93, 5.47),  # gap_before=0.52s → 여기서 분리
+            _word("이메일",  5.83, 6.14),
+        ]
+
+        result = segment(words, 12.0)
+
+        # 두 번째 발화가 "지금"으로 시작해야 함
+        texts = [u.transcript_text for u in result]
+        assert any(t.startswith("지금 DJI") or t.startswith("지금 이메일") for t in texts), \
+            f"'지금'이 다음 발화 앞으로 이동되지 않음: {texts}"
+
+        # 첫 번째 발화는 "혹시나"로 끝나야 함
+        assert not result[0].transcript_text.endswith("지금"), \
+            f"첫 발화 끝에 '지금'이 남아있음: {result[0].transcript_text}"
+
+    def test_does_not_move_when_gap_too_small(self, monkeypatch):
+        # gap < HANGING_WORD_GAP_SEC → 이동 없음
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "HANGING_WORD_GAP_SEC", 0.3)
+        monkeypatch.setattr(cfg, "SILENCE_GAP_SEC", 0.5)
+        monkeypatch.setattr(cfg, "MIN_UTTERANCE_SEC", 1.0)
+        monkeypatch.setattr(cfg, "MAX_UTTERANCE_SEC", 30.0)
+
+        words = [
+            _word("안녕",  0.0,  0.5),
+            _word("하세요", 0.6,  1.0),  # gap_before=0.1s < 0.3 → 이동 안 함
+            _word("네",    1.6,  2.0),  # gap_before=0.6s → 분리
+            _word("맞아요", 2.1,  2.8),
+        ]
+
+        result = segment(words, 5.0)
+
+        # "하세요"는 첫 발화에 그대로 있어야 함
+        assert "하세요" in result[0].transcript_text
+
+    def test_does_not_move_when_utterance_has_single_word(self, monkeypatch):
+        # 발화 단어 수가 1개면 이동 불가
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "HANGING_WORD_GAP_SEC", 0.3)
+        monkeypatch.setattr(cfg, "SILENCE_GAP_SEC", 0.5)
+        monkeypatch.setattr(cfg, "MIN_UTTERANCE_SEC", 0.0)
+        monkeypatch.setattr(cfg, "MAX_UTTERANCE_SEC", 30.0)
+
+        words = [
+            _word("어",   0.0, 0.2),   # 1단어 발화 → 이동 불가
+            _word("그래서", 0.8, 1.2),  # gap_before=0.6s → 분리
+            _word("맞아",  1.3, 1.7),
+        ]
+
+        result = segment(words, 5.0)
+        assert result[0].transcript_text == "어"
+
+    def test_does_not_move_across_different_speakers(self, monkeypatch):
+        # 화자가 다르면 이동 안 함
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "HANGING_WORD_GAP_SEC", 0.3)
+        monkeypatch.setattr(cfg, "SILENCE_GAP_SEC", 0.5)
+        monkeypatch.setattr(cfg, "MIN_UTTERANCE_SEC", 0.0)
+        monkeypatch.setattr(cfg, "MAX_UTTERANCE_SEC", 30.0)
+
+        words = [
+            _word("지금",   0.0,  0.3, "SPEAKER_0"),
+            _word("혹시나", 0.4,  0.8, "SPEAKER_0"),
+            _word("아마도", 1.2,  1.6, "SPEAKER_0"),  # gap_before=0.4s ≥ 0.3 → 이동 후보
+            _word("맞아요", 2.2,  2.8, "SPEAKER_1"),  # 다른 화자 → 이동 안 함
+        ]
+
+        result = segment(words, 5.0)
+        # "아마도"는 SPEAKER_0 발화에 남아야 함
+        sp0_texts = [u.transcript_text for u in result if u.speaker_id == "SPEAKER_0"]
+        assert any("아마도" in t for t in sp0_texts)

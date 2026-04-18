@@ -16,6 +16,7 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "2"))
 
 # HuggingFace 토큰 (화자분리용)
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
+DIARIZATION_MODEL = os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
 
 # 파일 경로 (RAM 디스크)
 TEMP_DIR = Path(os.environ.get("TEMP_DIR", "/dev/shm/stt-temp"))
@@ -84,8 +85,19 @@ SILENCE_COMPRESS_TARGET_SEC = float(os.environ.get("SILENCE_COMPRESS_TARGET_SEC"
 # 0.0005로 낮추어 감쇠된 voice frame이 silence로 오분류되지 않게 한다.
 SILENCE_RMS_THRESHOLD_DENOISE = float(os.environ.get("SILENCE_RMS_THRESHOLD_DENOISE", "0.0005"))
 
+# 발화 끝 떠돌이 단어(hanging word) 보정 — 직전 단어와 이 간격 이상이면 다음 발화로 이동
+HANGING_WORD_GAP_SEC = float(os.environ.get("HANGING_WORD_GAP_SEC", "0.3"))
+
 # Gain Normalize 최대 증폭 (노이즈 증폭 방지)
 MAX_GAIN_X = float(os.environ.get("MAX_GAIN_X", "10.0"))
+# 로컬 게인 정규화 최대 증폭 — 글로벌보다 높게 허용하여 조용한 구간의 VAD 감지 개선
+LOCAL_MAX_GAIN_X = float(os.environ.get("LOCAL_MAX_GAIN_X", "30.0"))
+
+# WhisperX 내부 silero VAD 임계값 (낮을수록 조용한 speech 감지 향상)
+# 기본값: onset=0.500, offset=0.363 — 조용한 구간 누락 시 낮춤
+# 0.15로 낮춰야 작은 음량(volume < -20dBFS) 구간도 speech로 인식
+VAD_ONSET = float(os.environ.get("VAD_ONSET", "0.150"))
+VAD_OFFSET = float(os.environ.get("VAD_OFFSET", "0.100"))
 
 # STT 힌트 (고유명사 인식 개선)
 HOTWORDS = os.environ.get("HOTWORDS", None)

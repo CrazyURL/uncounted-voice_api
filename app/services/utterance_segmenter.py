@@ -23,7 +23,8 @@ def segment(words: list[dict], total_duration: float) -> list[UtteranceBoundary]
         return []
 
     raw = _split_by_boundaries(words)
-    merged = _merge_short_utterances(raw)
+    fixed = _fix_hanging_words(raw)
+    merged = _merge_short_utterances(fixed)
     split = _split_long_utterances(merged)
     return _apply_padding(split, total_duration)
 
@@ -70,6 +71,40 @@ def _split_by_boundaries(words: list[dict]) -> list[_RawUtterance]:
         utterances.append(_RawUtterance(current_speaker, current_words))
 
     return utterances
+
+
+# -- Step 2: Fix hanging words --
+
+def _fix_hanging_words(utterances: list[_RawUtterance]) -> list[_RawUtterance]:
+    """발화 끝에 고립된 단어를 다음 발화 앞으로 이동.
+
+    조건: 발화 마지막 단어의 직전 gap >= HANGING_WORD_GAP_SEC
+          AND 현재 발화 단어 수 > 1
+          AND 다음 발화 화자가 같음 (화자 보존)
+    """
+    result = list(utterances)
+
+    for i in range(len(result) - 1):
+        u = result[i]
+        next_u = result[i + 1]
+
+        if len(u.words) <= 1:
+            continue
+
+        last_word = u.words[-1]
+        prev_word = u.words[-2]
+        gap_before_last = _to_float(last_word.get("start")) - _to_float(prev_word.get("end"))
+
+        if gap_before_last < config.HANGING_WORD_GAP_SEC:
+            continue
+
+        if _get_speaker_id(last_word) != next_u.speaker_id:
+            continue
+
+        result[i] = _RawUtterance(u.speaker_id, u.words[:-1])
+        result[i + 1] = _RawUtterance(next_u.speaker_id, [last_word] + list(next_u.words))
+
+    return result
 
 
 # -- Step 3 & 5: Merge short, preserve short answers --
@@ -127,9 +162,12 @@ def _merge_short_utterances(utterances: list[_RawUtterance]) -> list[_RawUtteran
 
         last = result[-1]
 
-        # 같은 화자 → 이전 발화에 병합
+        # 같은 화자 → 이전 발화에 병합 (단, last가 이미 충분히 길면 독립 유지)
         if last.speaker_id == curr.speaker_id:
-            result[-1] = last.merge_with(curr)
+            if last.duration < config.MIN_UTTERANCE_SEC:
+                result[-1] = last.merge_with(curr)
+            else:
+                result.append(curr)
         # 다른 화자 + 다음 발화가 같은 화자 → 다음에 병합
         elif i + 1 < len(working) and working[i + 1].speaker_id == curr.speaker_id:
             working[i + 1] = curr.merge_with(working[i + 1])

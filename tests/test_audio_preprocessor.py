@@ -8,6 +8,8 @@ import pytest
 from app.services.audio_preprocessor import (
     compress_silence,
     denoise,
+    local_normalize_gain,
+    normalize_gain,
     preprocess,
     remove_duplicates,
 )
@@ -312,3 +314,204 @@ class TestPreprocess:
         monkeypatch.setattr(cfg, "PREPROCESS_DENOISE_ENABLED", True)
         preprocess(audio, SR)
         mock_denoise.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestNormalizeGain
+# ---------------------------------------------------------------------------
+
+class TestNormalizeGain:
+    """normalize_gain() — 글로벌 RMS 정규화 (cap=MAX_GAIN_X=10x)."""
+
+    def test_boosts_quiet_audio_to_target_rms(self):
+        # sine RMS = amplitude/sqrt(2). 0.005*sine → RMS≈0.00354
+        # gain=28x이지만 MAX_GAIN_X=10x로 제한 → RMS≈0.0354
+        audio = _sine(440, 1.0) * 0.005
+        result = normalize_gain(audio)
+        input_rms = float(np.sqrt(np.mean(audio ** 2)))
+        result_rms = float(np.sqrt(np.mean(result ** 2)))
+        assert result_rms > input_rms * 9.0  # 9x 이상 부스트 확인 (상한 10x)
+
+    def test_does_not_boost_loud_audio(self):
+        # RMS가 이미 TARGET(0.1) 이상이면 변경 없음
+        audio = _sine(440, 1.0) * 0.5
+        result = normalize_gain(audio)
+        np.testing.assert_array_almost_equal(result, audio)
+
+    def test_caps_at_max_gain_x(self, monkeypatch):
+        # MAX_GAIN_X=5일 때 극단적으로 조용한 오디오에 5x 이상 부스트 안됨
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "MAX_GAIN_X", 5.0)
+        audio = _sine(440, 1.0) * 0.001
+        result = normalize_gain(audio)
+        input_rms = float(np.sqrt(np.mean(audio ** 2)))
+        result_rms = float(np.sqrt(np.mean(result ** 2)))
+        assert result_rms <= input_rms * 5.0 * 1.01  # 5x 이상 부스트 없음
+
+    def test_does_not_mutate_input(self):
+        audio = _sine(440, 1.0) * 0.01
+        original = audio.copy()
+        normalize_gain(audio)
+        np.testing.assert_array_equal(audio, original)
+
+    def test_handles_silence(self):
+        audio = _silence(1.0)
+        result = normalize_gain(audio)
+        np.testing.assert_array_equal(result, audio)
+
+    def test_output_clipped_within_bounds(self):
+        audio = _sine(440, 1.0) * 0.001
+        result = normalize_gain(audio)
+        assert float(np.max(np.abs(result))) <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# TestLocalNormalizeGain
+# ---------------------------------------------------------------------------
+
+class TestLocalNormalizeGain:
+    """local_normalize_gain() — 슬라이딩 윈도우 로컬 게인 (cap=LOCAL_MAX_GAIN_X=30x).
+
+    핵심 케이스:
+    1. 매우 조용한 오디오가 글로벌 10x 이후에도 부족하면 로컬 30x로 추가 부스트
+    2. 이미 충분히 큰 구간은 감쇠 없음 (부스트 전용)
+    3. 노이즈만 있는 무음 구간 과도 증폭 없음
+    4. LOCAL_MAX_GAIN_X=10x이면 MAX_GAIN_X=10x와 동일 동작
+    """
+
+    def test_boosts_very_quiet_audio_beyond_global_cap(self, monkeypatch):
+        # 글로벌 10x 후에도 RMS가 낮은 경우 로컬 30x가 추가 부스트
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "LOCAL_MAX_GAIN_X", 30.0)
+
+        # RMS 0.001 → 글로벌 10x → RMS ≈ 0.01 (여전히 낮음)
+        # local 30x → 해당 윈도우 RMS ≈ 0.1 도달 가능
+        audio = _sine(440, 2.0) * 0.001
+        globally_boosted = normalize_gain(audio)  # 10x 후
+        result = local_normalize_gain(globally_boosted, SR)
+
+        result_rms = float(np.sqrt(np.mean(result ** 2)))
+        boosted_rms = float(np.sqrt(np.mean(globally_boosted ** 2)))
+        assert result_rms > boosted_rms  # 로컬 부스트가 추가로 작동
+
+    def test_local_cap_higher_than_global_cap(self, monkeypatch):
+        # LOCAL_MAX_GAIN_X=30이 MAX_GAIN_X=10보다 높으므로 더 많은 부스트 가능
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "MAX_GAIN_X", 10.0)
+        monkeypatch.setattr(cfg, "LOCAL_MAX_GAIN_X", 30.0)
+
+        very_quiet = _sine(440, 2.0) * 0.001
+        result_local30 = local_normalize_gain(very_quiet.copy(), SR)
+
+        monkeypatch.setattr(cfg, "LOCAL_MAX_GAIN_X", 10.0)
+        result_local10 = local_normalize_gain(very_quiet.copy(), SR)
+
+        rms_30 = float(np.sqrt(np.mean(result_local30 ** 2)))
+        rms_10 = float(np.sqrt(np.mean(result_local10 ** 2)))
+        assert rms_30 >= rms_10  # 30x cap이 더 높은 RMS 도달
+
+    def test_does_not_attenuate_loud_segments(self, monkeypatch):
+        # 이미 충분히 큰 구간(RMS >= TARGET)은 gain=1.0 유지
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "LOCAL_MAX_GAIN_X", 30.0)
+
+        audio = _sine(440, 2.0) * 0.5  # RMS ≈ 0.35 (TARGET=0.1보다 큼)
+        result = local_normalize_gain(audio, SR)
+
+        # 감쇠 없음 — 출력이 입력보다 작아선 안 됨
+        result_rms = float(np.sqrt(np.mean(result ** 2)))
+        input_rms = float(np.sqrt(np.mean(audio ** 2)))
+        assert result_rms >= input_rms * 0.99
+
+    def test_output_clipped_within_bounds(self, monkeypatch):
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "LOCAL_MAX_GAIN_X", 30.0)
+
+        audio = _sine(440, 2.0) * 0.001
+        result = local_normalize_gain(audio, SR)
+        assert float(np.max(np.abs(result))) <= 1.0
+
+    def test_does_not_mutate_input(self, monkeypatch):
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "LOCAL_MAX_GAIN_X", 30.0)
+
+        audio = _sine(440, 2.0) * 0.005
+        original = audio.copy()
+        local_normalize_gain(audio, SR)
+        np.testing.assert_array_equal(audio, original)
+
+    def test_handles_very_short_audio(self, monkeypatch):
+        # 500ms 윈도우보다 짧으면 그대로 반환
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "LOCAL_MAX_GAIN_X", 30.0)
+
+        audio = _sine(440, 0.2)  # 200ms < 500ms window
+        result = local_normalize_gain(audio, SR)
+        np.testing.assert_array_equal(result, audio)
+
+    def test_silence_segments_not_over_amplified(self, monkeypatch):
+        # 진짜 무음 구간(rms < 1e-7)은 gain=1.0 유지 — 폭발 방지
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "LOCAL_MAX_GAIN_X", 30.0)
+
+        silence = _silence(1.0)
+        result = local_normalize_gain(silence, SR)
+
+        # 무음은 무음으로 유지
+        result_rms = float(np.sqrt(np.mean(result ** 2)))
+        assert result_rms < 1e-5
+
+    def test_quiet_speech_followed_by_silence(self, monkeypatch):
+        # 조용한 발화 + 무음 구간 혼합 — 발화 구간만 부스트되어야 함
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "LOCAL_MAX_GAIN_X", 30.0)
+
+        speech = _sine(440, 1.0) * 0.002
+        silence = _silence(1.0)
+        audio = np.concatenate([speech, silence]).astype(np.float32)
+
+        result = local_normalize_gain(audio, SR)
+
+        speech_rms_out = float(np.sqrt(np.mean(result[:SR] ** 2)))
+        silence_rms_out = float(np.sqrt(np.mean(result[SR:] ** 2)))
+
+        assert speech_rms_out > silence_rms_out * 10  # 발화 구간이 무음보다 월등히 큼
+
+
+# ---------------------------------------------------------------------------
+# TestGainPipelineIntegration  (normalize_gain → local_normalize_gain 연계)
+# ---------------------------------------------------------------------------
+
+class TestGainPipelineIntegration:
+    """글로벌 → 로컬 게인 순차 적용 통합 케이스."""
+
+    def test_very_quiet_audio_reaches_adequate_rms(self, monkeypatch):
+        # RMS 0.001 오디오가 파이프라인 후 VAD 감지 가능 수준(≥0.05)에 도달
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "MAX_GAIN_X", 10.0)
+        monkeypatch.setattr(cfg, "LOCAL_MAX_GAIN_X", 30.0)
+
+        audio = _sine(440, 2.0) * 0.001
+        step1 = normalize_gain(audio)
+        step2 = local_normalize_gain(step1, SR)
+
+        final_rms = float(np.sqrt(np.mean(step2 ** 2)))
+        assert final_rms >= 0.05  # silero VAD가 감지할 수 있는 수준
+
+    def test_local30_outperforms_local10_on_quiet_audio(self, monkeypatch):
+        # LOCAL_MAX_GAIN_X=30이 10일 때보다 조용한 오디오를 더 잘 끌어올림
+        from app import config as cfg
+        monkeypatch.setattr(cfg, "MAX_GAIN_X", 10.0)
+
+        audio = _sine(440, 2.0) * 0.001
+        step1 = normalize_gain(audio)
+
+        monkeypatch.setattr(cfg, "LOCAL_MAX_GAIN_X", 30.0)
+        result_30 = local_normalize_gain(step1.copy(), SR)
+
+        monkeypatch.setattr(cfg, "LOCAL_MAX_GAIN_X", 10.0)
+        result_10 = local_normalize_gain(step1.copy(), SR)
+
+        rms_30 = float(np.sqrt(np.mean(result_30 ** 2)))
+        rms_10 = float(np.sqrt(np.mean(result_10 ** 2)))
+        assert rms_30 > rms_10

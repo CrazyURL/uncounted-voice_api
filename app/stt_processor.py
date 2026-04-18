@@ -336,7 +336,9 @@ def load_models():
         compute_type=config.COMPUTE_TYPE,
         language=config.LANGUAGE,
         asr_options=asr_options if asr_options else None,
+        vad_options={"vad_onset": config.VAD_ONSET, "vad_offset": config.VAD_OFFSET},
     )
+    logger.info("Silero VAD 사용 (onset=%.3f, offset=%.3f)", config.VAD_ONSET, config.VAD_OFFSET)
 
     # Forced alignment 모델
     _align_model, _align_metadata = whisperx.load_align_model(
@@ -349,9 +351,11 @@ def load_models():
         logger.info("화자분리 모델 로딩 중 (HF_TOKEN 감지)...")
         try:
             _diarize_model = DiarizationPipeline(
+                model_name=config.DIARIZATION_MODEL,
                 token=config.HF_TOKEN,
                 device=config.DEVICE,
             )
+            logger.info("화자분리 모델 로딩 완료 (model=%s)", config.DIARIZATION_MODEL)
         except Exception as e:
             logger.warning("화자분리 모델 로딩 실패 — 화자분리 비활성화: %s", e)
             _diarize_model = None
