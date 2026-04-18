@@ -43,6 +43,16 @@
 | `DUPLICATE_CORR_THRESHOLD` | `0.85` | Cross-correlation threshold for duplicate detection |
 | `PREPROCESS_FRAME_MS` | `20` | Frame size for silence compression (ms) |
 | `MAX_DEDUP_LOOKAHEAD` | `5` | Max forward windows to compare for dedup |
+| `LOCAL_MAX_GAIN_X` | `30.0` | 500ms 슬라이딩 윈도우 로컬 게인 최대 배수 |
+
+### VAD & Diarization
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `VAD_ONSET` | `0.150` | Silero VAD 활성화 임계값 (낮을수록 민감) |
+| `VAD_OFFSET` | `0.100` | Silero VAD 비활성화 임계값 |
+| `DIARIZATION_MODEL` | `pyannote/speaker-diarization-3.1` | 화자분리 모델 ID |
+| `HANGING_WORD_GAP_SEC` | `0.3` | 발화 끝 단어 gap 기준 (초) — 이 이상 gap 후 고립 단어는 다음 발화로 이동 |
 
 ### Large Audio Chunking
 
