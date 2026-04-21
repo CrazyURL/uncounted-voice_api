@@ -14,13 +14,20 @@ class TaskStatus(str, Enum):
 
 
 class TaskInfo(BaseModel):
-    """내부 작업 상태 관리용 모델 (API 응답에 직접 노출되지 않음)."""
+    """내부 작업 상태 관리용 모델 (API 응답에 직접 노출되지 않음).
+
+    관측용 timing 필드(queued_at / gpu_acquired_at / gpu_released_at)는 유닉스
+    초 단위 timestamp이며, 폴링 타임아웃 원인 분석용이다.
+    """
     model_config = {"arbitrary_types_allowed": True}
 
     task_id: str
     status: TaskStatus = TaskStatus.pending
     result: Any = None
     error: Optional[str] = None
+    queued_at: Optional[float] = None
+    gpu_acquired_at: Optional[float] = None
+    gpu_released_at: Optional[float] = None
 
 
 class TranscribeRequest(BaseModel):
@@ -333,7 +340,11 @@ class TranscribeResultResponse(BaseModel):
 
 
 class JobPendingResponse(BaseModel):
-    """작업이 아직 진행 중일 때 반환되는 응답."""
+    """작업이 아직 진행 중일 때 반환되는 응답.
+
+    관측용 optional 필드(position_in_queue 등)는 폴링 타임아웃 원인 분석용이며,
+    기존 클라이언트는 무시해도 무방하다.
+    """
 
     task_id: str = Field(
         ...,
@@ -344,6 +355,38 @@ class JobPendingResponse(BaseModel):
         ...,
         description="작업 상태 (`pending` 또는 `processing`)",
         examples=["processing"],
+    )
+    position_in_queue: Optional[int] = Field(
+        None,
+        description="queued_at 기준 대기 순번 (1-based). GPU 점유 중 포함. 완료 시 null.",
+        examples=[2],
+    )
+    queue_size: Optional[int] = Field(
+        None,
+        description="현재 pending + processing 상태 작업 수",
+        examples=[3],
+    )
+    gpu_busy: Optional[bool] = Field(
+        None,
+        description="현재 GPU 세마포어 점유 여부 (gpu_acquired_at 있고 gpu_released_at 없음)",
+    )
+    queued_at: Optional[float] = Field(
+        None,
+        description="작업 생성 시각 (unix seconds)",
+    )
+    gpu_acquired_at: Optional[float] = Field(
+        None,
+        description="GPU 세마포어 획득 시각 (unix seconds). 획득 전은 null.",
+    )
+    elapsed_queue_seconds: Optional[float] = Field(
+        None,
+        description="큐 대기 시간(초). GPU 획득 전은 현재까지 대기, 획득 후는 대기 총 시간.",
+        examples=[45.2],
+    )
+    elapsed_processing_seconds: Optional[float] = Field(
+        None,
+        description="GPU 처리 시간(초). GPU 획득 후부터 현재(또는 release)까지.",
+        examples=[12.8],
     )
 
 
@@ -395,6 +438,24 @@ class QueueStatus(BaseModel):
         "100 이상은 큐 포화 상태.",
         examples=[60.0],
         ge=0,
+    )
+    gpu_busy: Optional[bool] = Field(
+        None,
+        description="현재 GPU 세마포어 점유 여부 (acquired 후 release 전)",
+    )
+    current_task_id: Optional[str] = Field(
+        None,
+        description="현재 GPU를 점유 중인 task_id. 없으면 null",
+        examples=["a1b2c3d4e5f6"],
+    )
+    queue_depth: Optional[int] = Field(
+        None,
+        description="pending + processing 중 GPU 미점유 task 수 (현재 처리 중 제외)",
+        examples=[2],
+    )
+    waiting_task_ids: Optional[list[str]] = Field(
+        None,
+        description="대기 중인 task_id 목록 (queued_at 오름차순, 현재 GPU 점유 task 제외)",
     )
 
 

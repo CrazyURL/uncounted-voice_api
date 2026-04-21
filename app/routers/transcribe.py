@@ -1,4 +1,5 @@
 import logging
+import time
 import uuid
 from pathlib import Path as FilePath, PurePosixPath
 from typing import Union
@@ -401,9 +402,40 @@ async def get_job_status(
 
     if task.status == TaskStatus.completed:
         return task.result
+
+    # 진행 중 응답에 관측용 필드 동봉 (폴링 타임아웃 원인 분석용)
+    snapshot = job_store.queue_snapshot()
+    position = job_store.position_of(task_id)
+    now = time.time()
+
+    if task.queued_at is not None:
+        if task.gpu_acquired_at is not None:
+            elapsed_queue = task.gpu_acquired_at - task.queued_at
+        else:
+            elapsed_queue = now - task.queued_at
+    else:
+        elapsed_queue = None
+
+    if task.gpu_acquired_at is not None:
+        end_ts = task.gpu_released_at if task.gpu_released_at is not None else now
+        elapsed_processing = end_ts - task.gpu_acquired_at
+    else:
+        elapsed_processing = None
+
     return {
         "task_id": task_id,
         "status": task.status.value,
+        "position_in_queue": position,
+        "queue_size": snapshot["queue_depth"] + (1 if snapshot["gpu_busy"] else 0),
+        "gpu_busy": snapshot["gpu_busy"],
+        "queued_at": task.queued_at,
+        "gpu_acquired_at": task.gpu_acquired_at,
+        "elapsed_queue_seconds": (
+            round(elapsed_queue, 2) if elapsed_queue is not None else None
+        ),
+        "elapsed_processing_seconds": (
+            round(elapsed_processing, 2) if elapsed_processing is not None else None
+        ),
     }
 
 

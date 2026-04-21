@@ -96,6 +96,7 @@ async def health_check():
     active = job_store.active_count()
     max_active = config.MAX_ACTIVE_JOBS
     utilization = round(active * 100 / max_active, 1) if max_active > 0 else 0.0
+    snapshot = job_store.queue_snapshot()
 
     return {
         "status": "ok",
@@ -109,5 +110,9 @@ async def health_check():
             "active": active,
             "max_active": max_active,
             "utilization_pct": utilization,
+            "gpu_busy": snapshot["gpu_busy"],
+            "current_task_id": snapshot["current_task_id"],
+            "queue_depth": snapshot["queue_depth"],
+            "waiting_task_ids": snapshot["waiting_task_ids"],
         },
     }

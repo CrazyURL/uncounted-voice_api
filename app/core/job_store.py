@@ -42,10 +42,11 @@ class JobStore:
         return Path("/tmp/stt-results")
 
     def create(self, task_id: str) -> TaskInfo:
-        task = TaskInfo(task_id=task_id, status=TaskStatus.pending)
+        now = time.time()
+        task = TaskInfo(task_id=task_id, status=TaskStatus.pending, queued_at=now)
         with self._lock:
             self._tasks[task_id] = task
-            self._timestamps[task_id] = time.time()
+            self._timestamps[task_id] = now
             self._cleanup_expired()
         return task
 
@@ -82,6 +83,76 @@ class JobStore:
                 self._tasks[task_id] = task.model_copy(
                     update={"status": TaskStatus.failed, "error": error}
                 )
+
+    def update_gpu_acquired(self, task_id: str) -> None:
+        """GPU 세마포어 획득 시각 기록 (관측용)."""
+        now = time.time()
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None:
+                self._tasks[task_id] = task.model_copy(update={"gpu_acquired_at": now})
+
+    def update_gpu_released(self, task_id: str) -> None:
+        """GPU 세마포어 해제 시각 기록 (관측용)."""
+        now = time.time()
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None:
+                self._tasks[task_id] = task.model_copy(update={"gpu_released_at": now})
+
+    def position_of(self, task_id: str) -> Optional[int]:
+        """queued_at 기준 1-based 대기 순번을 반환한다.
+
+        대기 집합 = pending + processing 상태 (GPU 점유 중 포함).
+        complete/failed 이거나 queued_at 없으면 None.
+        """
+        with self._lock:
+            target = self._tasks.get(task_id)
+            if target is None or target.queued_at is None:
+                return None
+            if target.status not in (TaskStatus.pending, TaskStatus.processing):
+                return None
+            waiting = [
+                t for t in self._tasks.values()
+                if t.status in (TaskStatus.pending, TaskStatus.processing)
+                and t.queued_at is not None
+            ]
+            waiting.sort(key=lambda t: t.queued_at)  # type: ignore[return-value,arg-type]
+            for idx, t in enumerate(waiting):
+                if t.task_id == task_id:
+                    return idx + 1
+            return None
+
+    def queue_snapshot(self) -> dict:
+        """GPU 세마포어 점유 상황 + 대기 큐 상태 스냅샷 (관측용).
+
+        Returns:
+            dict with keys: gpu_busy, current_task_id, queue_depth, waiting_task_ids.
+        """
+        with self._lock:
+            current: Optional[TaskInfo] = None
+            pending: list[TaskInfo] = []
+            for t in self._tasks.values():
+                if t.status not in (TaskStatus.pending, TaskStatus.processing):
+                    continue
+                # GPU 점유 중: acquired 있고 released 없음
+                if t.gpu_acquired_at is not None and t.gpu_released_at is None:
+                    # 세마포어(1) 가정 하에 현재 점유 task는 최대 1개
+                    if current is None or (
+                        t.gpu_acquired_at
+                        and current.gpu_acquired_at
+                        and t.gpu_acquired_at > current.gpu_acquired_at
+                    ):
+                        current = t
+                else:
+                    pending.append(t)
+            pending.sort(key=lambda x: x.queued_at or 0.0)
+            return {
+                "gpu_busy": current is not None,
+                "current_task_id": current.task_id if current else None,
+                "queue_depth": len(pending),
+                "waiting_task_ids": [t.task_id for t in pending],
+            }
 
 
     def set_audio(self, task_id: str, audio_files: dict[str, bytes]) -> None:

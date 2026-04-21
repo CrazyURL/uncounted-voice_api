@@ -12,6 +12,7 @@ import whisperx
 from whisperx.diarize import DiarizationPipeline
 
 from app import config
+from app.core.job_store import job_store
 from app.pii_masker import mask_pii, mask_segments
 from app.services.audio_preprocessor import load_df_model, preprocess
 from app.services.diarization_config import DiarizationConfig
@@ -384,8 +385,12 @@ def _transcribe_chunk(
         diarization_options = {}
 
     # GPU 추론 (전처리는 호출자가 이미 적용)
+    lock_wait_start = time.time()
     _gpu_lock.acquire()
-    logger.info("[%s] GPU lock 획득", task_id)
+    lock_wait_ms = int((time.time() - lock_wait_start) * 1000)
+    inference_start = time.time()
+    job_store.update_gpu_acquired(task_id)
+    logger.info("[%s] GPU lock 획득 | lock_wait_ms=%d", task_id, lock_wait_ms)
     try:
         result = _model.transcribe(audio, batch_size=config.BATCH_SIZE)
         logger.info("[%s] Transcribe 완료 (%d 세그먼트)", task_id, len(result["segments"]))
@@ -410,9 +415,14 @@ def _transcribe_chunk(
             except Exception as diarize_err:
                 logger.warning("[%s] 화자분리 실패: %s", task_id, diarize_err)
     finally:
+        inference_ms = int((time.time() - inference_start) * 1000)
         torch.cuda.empty_cache()
         _gpu_lock.release()
-        logger.info("[%s] GPU lock 해제 (VRAM 정리 완료)", task_id)
+        job_store.update_gpu_released(task_id)
+        logger.info(
+            "[%s] GPU lock 해제 | inference_ms=%d lock_wait_ms=%d (VRAM 정리 완료)",
+            task_id, inference_ms, lock_wait_ms,
+        )
 
     return _clean_segments(result["segments"])
 
@@ -586,8 +596,12 @@ def transcribe(
             logger.info("[%s] 오디오 로드 완료 (%.1fs)", task_id, len(audio) / config.SAMPLE_RATE)
             audio = preprocess(audio, config.SAMPLE_RATE)
 
+            lock_wait_start = time.time()
             _gpu_lock.acquire()
-            logger.info("[%s] GPU lock 획득", task_id)
+            lock_wait_ms = int((time.time() - lock_wait_start) * 1000)
+            inference_start = time.time()
+            job_store.update_gpu_acquired(task_id)
+            logger.info("[%s] GPU lock 획득 | lock_wait_ms=%d", task_id, lock_wait_ms)
             try:
                 result = _model.transcribe(audio, batch_size=config.BATCH_SIZE)
                 logger.info("[%s] Transcribe 완료 (%d 세그먼트)", task_id, len(result["segments"]))
@@ -614,9 +628,14 @@ def transcribe(
                 except Exception as diarize_err:
                     logger.warning("[%s] 화자분리 실패: %s", task_id, diarize_err)
             finally:
+                inference_ms = int((time.time() - inference_start) * 1000)
                 torch.cuda.empty_cache()
                 _gpu_lock.release()
-                logger.info("[%s] GPU lock 해제 (VRAM 정리 완료)", task_id)
+                job_store.update_gpu_released(task_id)
+                logger.info(
+                    "[%s] GPU lock 해제 | inference_ms=%d lock_wait_ms=%d (VRAM 정리 완료)",
+                    task_id, inference_ms, lock_wait_ms,
+                )
 
             segments = _clean_segments(result["segments"])
             diarize_active = enable_diarize and _diarize_model is not None
