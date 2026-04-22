@@ -5,6 +5,7 @@ paths:
   - "app/services/audio_preprocessor.py"
   - "app/services/utterance_segmenter.py"
   - "app/services/audio_splitter.py"
+  - "app/services/audio_pii_masker.py"
   - "app/routers/transcribe.py"
 ---
 
@@ -13,8 +14,12 @@ paths:
 ## Processing Flow
 
 ```
-Upload → Preprocess (gain → denoise → dedup → silence) → GPU Inference → Alignment → (Diarization) → PII Masking → Result
+Upload → Preprocess (gain → denoise → dedup → silence) → GPU Inference → Alignment →
+  (Diarization) → [Audio PII Masking, opt-in] → Text PII Masking → Speaker/Utterance Split → Result
 ```
+
+- **Audio PII Masking**은 `mask_audio_pii=true`일 때 음성(PCM)의 PII 구간을 1kHz 비프로 치환. Text masking 전에 수행되어 생성되는 `speaker_audio`/`utterance_audio`에 자연히 반영된다.
+- **Text PII Masking**은 segment text의 regex 치환. 항상 수행(`mask_pii=true` 기본).
 
 ## Key Components
 
@@ -25,7 +30,8 @@ Upload → Preprocess (gain → denoise → dedup → silence) → GPU Inference
 | `whisperx_service.py` | Thin wrapper (static methods) over stt_processor |
 | `utterance_segmenter.py` | Word-level utterance boundary detection |
 | `audio_splitter.py` | Per-utterance/per-speaker WAV extraction |
-| `pii_masker.py` | Korean PII regex masking (9 types + optional name masking) |
+| `pii_masker.py` | Korean PII regex: `detect_pii_spans` (위치), `mask_pii` (치환), 9 types + optional name masking |
+| `audio_pii_masker.py` | Audio-level PII: char span→word timestamp 매핑 + 1kHz 비프 치환 (10ms fade) |
 
 ## GPU Singleton Pattern
 
