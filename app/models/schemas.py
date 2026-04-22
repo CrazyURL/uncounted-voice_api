@@ -104,6 +104,13 @@ class SegmentResponse(BaseModel):
     )
 
 
+class TimeRange(BaseModel):
+    """오디오 시간 범위 (초)."""
+
+    start: float = Field(..., description="시작 시간 (초)", examples=[1.23])
+    end: float = Field(..., description="종료 시간 (초)", examples=[4.56])
+
+
 class PIIDetectedItem(BaseModel):
     """감지된 PII 유형별 요약.
 
@@ -123,6 +130,11 @@ class PIIDetectedItem(BaseModel):
         examples=[2],
         ge=1,
     )
+    time_ranges: Optional[list[TimeRange]] = Field(
+        None,
+        description="해당 PII가 감지된 오디오 시간 범위 목록. `mask_audio_pii=true` 시 포함됩니다.",
+    )
+
 
 
 class TranscribeAcceptedResponse(BaseModel):

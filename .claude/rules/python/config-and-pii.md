@@ -64,6 +64,14 @@
 | `CHUNK_SILENCE_DUR` | `0.3` | Minimum silence duration for split point (seconds) |
 | `CHUNK_MARGIN_SEC` | `300` | Split point search range around target (±5min) |
 
+### PII Masking
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `PII_MASK_PAD_SEC` | `0.15` | 음성 PII 마스킹 시 앞뒤 패딩 (초) |
+
 ## PII Masking Details
 
 `pii_masker.py` handles Korean-specific PII: resident registration numbers, driver's license, passport, card numbers, email, phone, bank accounts, IP addresses. Korean name masking is opt-in (`enable_name_masking`) and uses a surname list + context heuristics with an extensive exclude-prefix set to avoid false positives on common Korean words that start with surname characters.
+
+**Audio PII Masking**: When `mask_audio_pii=true` is requested, the system maps detected PII text spans to WhisperX word-level timestamps. The corresponding audio segments are replaced with a **1kHz sine wave beep** (0.1 amplitude) with **10ms linear fades** to prevent clicking. The masking applies to all generated output WAV files (utterances/speaker audio).

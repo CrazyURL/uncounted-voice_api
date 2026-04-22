@@ -97,6 +97,8 @@ python-dotenv==1.2.2
 python-multipart==0.0.24
 pytorch-lightning==2.6.1
 pytorch-metric-learning==2.9.0
+pytest==9.0.3
+pytest-cov==7.1.0
 PyYAML==6.0.3
 regex==2026.4.4
 requests==2.33.1

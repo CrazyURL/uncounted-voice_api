@@ -213,42 +213,105 @@ def _is_likely_name_with_context(
     return True
 
 
-def mask_pii(text: str, enable_name_masking: bool = False) -> dict:
-    """텍스트에서 PII를 마스킹하고 결과를 반환한다."""
-    masked_text = text
-    detected = []
+def detect_pii_spans(text: str, enable_name_masking: bool = False) -> list[dict]:
+    """텍스트에서 PII의 위치(span)를 감지하고 리스트로 반환한다."""
+    spans = []
 
-    for pattern, replacer, label in PII_PATTERNS:
-        matches = list(pattern.finditer(masked_text))
-        if matches:
-            detected.append({"type": label, "count": len(matches)})
-            masked_text = pattern.sub(replacer, masked_text)
+    # 1. PII_PATTERNS 감지
+    for pattern, _, label in PII_PATTERNS:
+        for m in pattern.finditer(text):
+            spans.append({
+                "type": label,
+                "char_start": m.start(),
+                "char_end": m.end(),
+                "matched_text": m.group(0)
+            })
 
-    # 선택적 이름 마스킹 (단일 컴파일 정규식 사용)
+    # 2. 이름 마스킹 감지
     if enable_name_masking:
-        name_count = 0
-
-        def _replace_name(m):
-            nonlocal name_count
+        for m in _SURNAME_PATTERN.finditer(text):
             s = m.group(1)
             g = m.group(2)
-            before = m.string[:m.start()]
-            after = m.string[m.end():]
+            before = text[:m.start()]
+            after = text[m.end():]
 
             if _is_likely_name_with_context(s, g, before, after):
-                name_count += 1
-                return f"{s}{'O' * len(g)}"
-            return m.group(0)
+                spans.append({
+                    "type": "이름",
+                    "char_start": m.start(),
+                    "char_end": m.end(),
+                    "matched_text": m.group(0)
+                })
 
-        masked_text = _SURNAME_PATTERN.sub(_replace_name, masked_text)
+    return spans
 
-        if name_count > 0:
-            detected.append({"type": "이름", "count": name_count})
+
+def mask_pii(text: str, enable_name_masking: bool = False) -> dict:
+    """텍스트에서 PII를 마스킹하고 결과를 반환한다."""
+    spans = detect_pii_spans(text, enable_name_masking)
+
+    # 중첩된 span 처리: 시작 위치 순, 길이 역순으로 정렬
+    spans.sort(key=lambda x: (x["char_start"], -(x["char_end"] - x["char_start"])))
+
+    # 중첩 제거 (먼저 나온 긴 패턴 우선)
+    non_overlapping = []
+    last_end = -1
+    for span in spans:
+        if span["char_start"] >= last_end:
+            non_overlapping.append(span)
+            last_end = span["char_end"]
+
+    # 역순 치환 (index 보존)
+    non_overlapping.sort(key=lambda x: x["char_start"], reverse=True)
+
+    masked_chars = list(text)
+    detected_summary = {}
+
+    for span in non_overlapping:
+        label = span["type"]
+        matched = span["matched_text"]
+        start = span["char_start"]
+        end = span["char_end"]
+
+        # 치환값 계산
+        replacer_val = None
+        if label == "이름":
+            s = matched[0]
+            g = matched[1:]
+            replacer_val = f"{s}{'O' * len(g)}"
+        else:
+            for p, r, l in PII_PATTERNS:
+                if l == label:
+                    m = p.fullmatch(matched)
+                    if m:
+                        replacer_val = r(m) if callable(r) else r
+                        break
+            if not replacer_val:
+                replacer_val = "*" * len(matched)
+
+        # 치환 적용
+        masked_chars[start:end] = list(replacer_val)
+
+        # 요약 업데이트
+        detected_summary[label] = detected_summary.get(label, 0) + 1
+
+    # PII_PATTERNS 선언 순서 + 이름을 마지막에 배치 (중복 라벨 제거, 하위 호환)
+    seen = set()
+    pattern_order: list[str] = []
+    for _, _, label in PII_PATTERNS:
+        if label not in seen:
+            seen.add(label)
+            pattern_order.append(label)
+    pattern_order.append("이름")
+    pii_detected = [
+        {"type": label, "count": detected_summary[label]}
+        for label in pattern_order if label in detected_summary
+    ]
 
     return {
-        "masked_text": masked_text,
-        "pii_detected": detected,
-        "total_masked": sum(d["count"] for d in detected),
+        "masked_text": "".join(masked_chars),
+        "pii_detected": pii_detected,
+        "total_masked": sum(detected_summary.values()),
     }
 
 

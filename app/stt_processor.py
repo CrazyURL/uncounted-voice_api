@@ -20,6 +20,7 @@ from app.services.recluster_config import ReclusterConfig
 from app.services.speaker_embedding import SpeakerEmbeddingModel
 from app.services.speaker_recluster import maybe_recluster_speakers
 from app.services.utterance_segmenter import segment as segment_utterances
+from app.services.audio_pii_masker import find_pii_word_ranges, mask_audio_ranges
 from app.services.audio_splitter import (
     extract_utterance_audio,
     mute_non_speaker,
@@ -434,11 +435,13 @@ def _transcribe_chunked(
     enable_diarize: bool,
     split_by_utterance: bool = False,
     diarization_options: dict | None = None,
-) -> tuple[list[dict], list[dict], dict[str, bytes]]:
+    mask_audio_pii: bool = False,
+    mask_audio_names: bool = False,
+) -> tuple[list[dict], list[dict], dict[str, bytes], list[tuple[float, float, str]]]:
     """대용량 오디오를 무음 기반으로 청크 분할하여 처리한다.
 
     Returns:
-        (all_segments, all_utterances, audio_files)
+        (all_segments, all_utterances, audio_files, pii_audio_ranges)
 
     `split_by_utterance=True`이고 화자분리가 활성화된 경우, 각 청크의
     `chunk_audio`가 메모리에 상주해 있는 동안 chunk-local 좌표계로
@@ -468,6 +471,7 @@ def _transcribe_chunked(
     all_segments: list[dict] = []
     all_utterances: list[dict] = []
     audio_files: dict[str, bytes] = {}
+    all_pii_audio_ranges: list[tuple[float, float, str]] = []
     global_utt_idx = 0
     # 전처리된 연속 타임라인 누적 offset — 각 청크의 전처리 후 실제 길이를 누적하여
     # 청크 경계에서 silence compression 등으로 삭제된 구간이 타임스탬프 gap으로
@@ -506,6 +510,23 @@ def _transcribe_chunked(
 
             chunk_segments = _transcribe_chunk(chunk_audio, task_id, enable_diarize, diarization_options)
 
+            # 4. 음성 PII 마스킹 (청크 모드)
+            if mask_audio_pii:
+                chunk_pii_ranges = find_pii_word_ranges(
+                    chunk_segments,
+                    enable_name_masking=mask_audio_names,
+                    pad_sec=config.PII_MASK_PAD_SEC,
+                )
+                if chunk_pii_ranges:
+                    chunk_audio = mask_audio_ranges(chunk_audio, chunk_pii_ranges, config.SAMPLE_RATE)
+                    # 글로벌 타임라인으로 변환하여 저장
+                    for s, e, t in chunk_pii_ranges:
+                        all_pii_audio_ranges.append((
+                            s + cumulative_preprocessed_offset,
+                            e + cumulative_preprocessed_offset,
+                            t
+                        ))
+
             # 청크 내 발화 분리 + WAV 생성 (chunk_audio가 살아있는 동안 수행)
             if emit_utterances:
                 chunk_utts, chunk_files, global_utt_idx = emit_chunk_utterances(
@@ -537,11 +558,11 @@ def _transcribe_chunked(
             torch.cuda.empty_cache()
 
     logger.info(
-        "[%s] 청크 모드 완료 (총 %d 세그먼트, %d 발화, 전처리 후 총 길이 %.1fs / 원본 %.1fs)",
-        task_id, len(all_segments), len(all_utterances),
+        "[%s] 청크 모드 완료 (총 %d 세그먼트, %d 발화, %d개 PII 마스킹, 전처리 후 총 길이 %.1fs / 원본 %.1fs)",
+        task_id, len(all_segments), len(all_utterances), len(all_pii_audio_ranges),
         cumulative_preprocessed_offset, total_duration,
     )
-    return all_segments, all_utterances, audio_files
+    return all_segments, all_utterances, audio_files, all_pii_audio_ranges
 
 
 def transcribe(
@@ -553,6 +574,8 @@ def transcribe(
     split_by_speaker: bool = False,
     split_by_utterance: bool = False,
     denoise_enabled: bool | None = None,
+    mask_audio_pii: bool = False,
+    mask_audio_names: bool = False,
 ) -> dict:
     """음성 파일을 STT 처리하고 마스킹된 결과를 반환한다.
 
@@ -578,15 +601,18 @@ def transcribe(
         # 미리 초기화해 short-circuit 조건에 의존하지 않게 한다.
         chunked_utterances: list[dict] = []
         chunked_audio_files: dict[str, bytes] = {}
+        pii_audio_ranges: list[tuple[float, float, str]] = []
 
         if use_chunked:
             # ── 청크 모드: 대용량 오디오 ──
             # 발화 WAV는 청크 내부에서 바로 생성된다. 화자별 WAV는 전체 배열이 필요하므로
             # 청크 모드에서는 제공하지 않는다 (API 스펙에 명시).
-            segments, chunked_utterances, chunked_audio_files = _transcribe_chunked(
+            segments, chunked_utterances, chunked_audio_files, pii_audio_ranges = _transcribe_chunked(
                 file_path, task_id, total_duration, enable_diarize,
                 split_by_utterance=split_by_utterance,
                 diarization_options=diarization_options,
+                mask_audio_pii=mask_audio_pii,
+                mask_audio_names=mask_audio_names,
             )
             audio = None
             diarize_active = enable_diarize and _diarize_model is not None
@@ -640,8 +666,33 @@ def transcribe(
             segments = _clean_segments(result["segments"])
             diarize_active = enable_diarize and _diarize_model is not None
 
-        # 5. PII 마스킹
+            # 5. 음성 PII 마스킹 (일반 모드)
+            if mask_audio_pii:
+                pii_audio_ranges = find_pii_word_ranges(
+                    segments,
+                    enable_name_masking=mask_audio_names,
+                    pad_sec=config.PII_MASK_PAD_SEC,
+                )
+                if pii_audio_ranges:
+                    audio = mask_audio_ranges(audio, pii_audio_ranges, config.SAMPLE_RATE)
+                    logger.info("[%s] 음성 PII 마스킹 완료 (%d개 구간)", task_id, len(pii_audio_ranges))
+
+        # 5. PII 마스킹 (텍스트)
         pii_summary = mask_segments(segments, enable_name_masking) if mask_pii else []
+
+        # 5.5 pii_summary에 음성 마스킹 시간 범위 통합 (immutable)
+        if mask_audio_pii and pii_audio_ranges:
+            type_to_ranges: dict[str, list[dict]] = {}
+            for r_start, r_end, p_type in pii_audio_ranges:
+                type_to_ranges.setdefault(p_type, []).append(
+                    {"start": round(r_start, 2), "end": round(r_end, 2)}
+                )
+            pii_summary = [
+                {**item, "time_ranges": type_to_ranges[item["type"]]}
+                if item["type"] in type_to_ranges
+                else {**item}
+                for item in pii_summary
+            ]
 
         # 6. 전체 텍스트
         full_text = " ".join(s["text"] for s in segments)

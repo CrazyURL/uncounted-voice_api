@@ -39,6 +39,8 @@ Swagger UI: `http://{host}:{port}/docs`
 | `diarize` | query | bool | `false` | 화자분리 활성화 (HF_TOKEN 필요) |
 | `mask_pii` | query | bool | `true` | PII 자동 마스킹 |
 | `enable_name_masking` | query | bool | `false` | 한국어 이름 마스킹 |
+| `mask_audio_pii` | query | bool | `false` | 음성 PII 마스킹 활성화 (1kHz 비프음 치환) |
+| `mask_audio_names` | query | bool | `false` | 음성 내 이름 마스킹 활성화 (mask_audio_pii=true 시 유효) |
 | `split_by_speaker` | query | bool | `false` | 화자별 오디오 분리 (diarize=true 필수) |
 | `split_by_utterance` | query | bool | `false` | 발화별 오디오 분리 (diarize=true 필수) |
 
@@ -93,7 +95,13 @@ curl -X POST "http://host:8000/api/v1/transcribe?diarize=true&split_by_utterance
     }
   ],
   "full_text": "왜 그러지? 어 끊어졌네 갑자기 ...",
-  "pii_summary": [{"type": "이름", "count": 1}],
+  "pii_summary": [
+    {
+      "type": "이름", 
+      "count": 1,
+      "time_ranges": [{"start": 1.35, "end": 2.15}]
+    }
+  ],
   "utterances": [
     {
       "index": 0,
@@ -134,6 +142,12 @@ curl -X POST "http://host:8000/api/v1/transcribe?diarize=true&split_by_utterance
 | `utterances[].words` | split_by_utterance=true | 발화 내 word 단위 데이터 |
 | `speaker_audio` | split_by_speaker=true | 화자별 mute 오디오 (원본 타임라인 유지, 상대방 무음) |
 | `pii_summary` | mask_pii=true | 마스킹된 PII 유형별 건수 |
+| `pii_summary[].time_ranges` | mask_audio_pii=true | PII가 감지된 음성 구간 목록 (start, end) |
+
+**음성 PII 마스킹 한계**
+- STT가 인식하지 못한 PII는 마스킹되지 않음 (best-effort). 클라이언트는 민감 오디오에 대해 추가 검토 필요
+- `len(time_ranges)`가 `count`보다 **적을 수 있음** — word-level timestamp가 없는 segment는 시간 매핑이 스킵됨 (텍스트 마스킹은 정상 수행)
+- **청크 모드(>1h)에서 `time_ranges`는 전처리 후(preprocessed) 좌표** — 무음 압축된 타임라인 기준이며 `segments[].start`/`end`와 일관됨. 원본 파일 시간과는 오차 존재
 
 **Errors**: 404 (task 없음), 500 (처리 실패)
 

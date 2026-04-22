@@ -39,6 +39,9 @@ MAX_UTTERANCE_SEC = float(os.environ.get("MAX_UTTERANCE_SEC", "30.0"))
 SHORT_ANSWER_MIN_SEC = float(os.environ.get("SHORT_ANSWER_MIN_SEC", "0.3"))
 PADDING_SEC = float(os.environ.get("PADDING_SEC", "0.15"))
 
+# PII 마스킹
+PII_MASK_PAD_SEC = float(os.environ.get("PII_MASK_PAD_SEC", "0.15"))
+
 # 로깅
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "DEBUG" if ENV == "dev" else "INFO")
 

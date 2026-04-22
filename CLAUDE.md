@@ -1,6 +1,6 @@
 # uncounted-voice-api — WhisperX STT Server
 
-WhisperX 기반 음성 처리 API. STT + 화자분리 + 발화분리 + PII 마스킹.
+WhisperX 기반 음성 처리 API. STT + 화자분리 + 발화분리 + 텍스트/음성 PII 마스킹.
 
 ## 기술 스택
 

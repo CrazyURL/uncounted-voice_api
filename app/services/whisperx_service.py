@@ -23,6 +23,8 @@ class WhisperXService:
         split_by_speaker: bool = False,
         split_by_utterance: bool = False,
         denoise_enabled: bool | None = None,
+        mask_audio_pii: bool = False,
+        mask_audio_names: bool = False,
     ) -> dict:
         return transcribe(
             file_path=file_path,
@@ -33,6 +35,8 @@ class WhisperXService:
             split_by_speaker=split_by_speaker,
             split_by_utterance=split_by_utterance,
             denoise_enabled=denoise_enabled,
+            mask_audio_pii=mask_audio_pii,
+            mask_audio_names=mask_audio_names,
         )
 
 

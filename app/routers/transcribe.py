@@ -32,6 +32,8 @@ def _process_audio(
     split_by_speaker: bool = False,
     split_by_utterance: bool = False,
     denoise: bool | None = None,
+    mask_audio_pii: bool = False,
+    mask_audio_names: bool = False,
 ):
     """Background task: run WhisperX pipeline and update job store."""
     try:
@@ -45,6 +47,8 @@ def _process_audio(
             split_by_speaker=split_by_speaker,
             split_by_utterance=split_by_utterance,
             denoise_enabled=denoise,
+            mask_audio_pii=mask_audio_pii,
+            mask_audio_names=mask_audio_names,
         )
         audio_files = result.pop("_audio_files", None)
         if audio_files:
@@ -148,6 +152,16 @@ async def transcribe_audio(
         description="배경 잡음 제거(DeepFilterNet) 활성화 여부. `false`로 설정하면 "
         "깨끗한 오디오의 전처리 속도를 개선할 수 있습니다.",
     ),
+    mask_audio_pii: bool = Query(
+        False,
+        description="음성 PII 마스킹 활성화 여부. `true`로 설정하면 "
+        "감지된 PII 구간을 1kHz 비프음으로 치환합니다.",
+    ),
+    mask_audio_names: bool = Query(
+        False,
+        description="음성 내 이름 마스킹 활성화 여부. `mask_audio_pii=true`일 때만 유효하며, "
+        "한국 성씨+이름 패턴을 탐지하여 비프음 처리합니다.",
+    ),
 ):
     # 확장자 검증
     ext = FilePath(file.filename or "").suffix.lstrip(".").lower()
@@ -219,6 +233,8 @@ async def transcribe_audio(
         split_by_speaker,
         split_by_utterance,
         denoise,
+        mask_audio_pii,
+        mask_audio_names,
     )
 
     return {"task_id": task_id, "status": "pending"}
