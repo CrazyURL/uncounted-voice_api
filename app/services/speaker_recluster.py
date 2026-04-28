@@ -239,7 +239,108 @@ def recluster_speakers(
 
         updated_words_list.append(updated_word)
 
+    # 클러스터 병합 + 부분 재할당으로 인해 ID 갭(예: SPEAKER_00, 01, 02, 04)이
+    # 발생할 수 있다. 최종 단계에서 0~N-1 연속 번호로 정규화.
+    if changed:
+        updated_words_list = _renumber_consecutive(updated_words_list, "speaker_id")
+
     return tuple(updated_words_list), confidence, changed
+
+
+def _renumber_consecutive(items: list[dict], key: str) -> list[dict]:
+    """speaker_id 갭(SPEAKER_00, 01, 02, 04 → 03 누락) 차단용 정규화.
+
+    pyannote / 부분 recluster 결과로 인해 ID가 비연속적이 되거나
+    "SPEAKER_0" 같은 비표준 형식이 섞이는 경우 모두 0~N-1 연속 번호로 재정리.
+
+    Args:
+        items: dict 리스트 (각 dict는 ``key`` 필드를 가짐)
+        key: speaker id 필드명
+
+    Returns:
+        재정렬된 dict 리스트 (첫 등장 순서 보존)
+    """
+    if not items:
+        return items
+
+    # 첫 등장 순서로 distinct speaker_id 수집
+    distinct: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        sid = item.get(key)
+        if sid and sid not in seen:
+            seen.add(sid)
+            distinct.append(sid)
+
+    if not distinct:
+        return items
+
+    # 매핑: 원본 → SPEAKER_NN (자릿수 패딩, 0부터 연속)
+    mapping = {old: f"SPEAKER_{i:02d}" for i, old in enumerate(distinct)}
+
+    # 적용
+    return [
+        {**item, key: mapping[item[key]]} if item.get(key) in mapping else item
+        for item in items
+    ]
+
+
+def renumber_speakers_in_place(
+    segments: list[dict] | None = None,
+    utterances: list[dict] | None = None,
+    speaker_audio: list[dict] | None = None,
+) -> None:
+    """파이프라인 최종 단계에서 모든 speaker_id를 0~N-1 연속 번호로 정규화.
+
+    segments의 speaker 필드를 기준으로 매핑을 만들고, segments / utterances /
+    speaker_audio / segments[].words 모두에 일관되게 적용한다. 각 dict는
+    in-place 수정된다.
+
+    Bug 7 (SPEAKER_03 누락) 안전망: pyannote 또는 recluster가 ID 갭을 만들거나
+    "SPEAKER_0" 같은 비표준 형식이 섞이는 모든 케이스 차단.
+    """
+    distinct: list[str] = []
+    seen: set[str] = set()
+
+    def collect(sid: object) -> None:
+        if isinstance(sid, str) and sid and sid not in seen:
+            seen.add(sid)
+            distinct.append(sid)
+
+    if segments:
+        for seg in segments:
+            collect(seg.get("speaker"))
+
+    if not distinct:
+        return
+
+    mapping = {old: f"SPEAKER_{i:02d}" for i, old in enumerate(distinct)}
+
+    if segments:
+        for seg in segments:
+            sp = seg.get("speaker")
+            if sp in mapping:
+                seg["speaker"] = mapping[sp]
+            for w in seg.get("words", []) or []:
+                wsp = w.get("speaker")
+                if wsp in mapping:
+                    w["speaker"] = mapping[wsp]
+
+    if utterances:
+        for u in utterances:
+            usp = u.get("speaker_id")
+            if usp in mapping:
+                u["speaker_id"] = mapping[usp]
+            for w in u.get("words", []) or []:
+                wsp = w.get("speaker")
+                if wsp in mapping:
+                    w["speaker"] = mapping[wsp]
+
+    if speaker_audio:
+        for sa in speaker_audio:
+            ssp = sa.get("speaker_id")
+            if ssp in mapping:
+                sa["speaker_id"] = mapping[ssp]
 
 
 def _cluster_two(embeddings: np.ndarray) -> np.ndarray:

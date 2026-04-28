@@ -17,7 +17,7 @@ from app.services.utterance_segmenter import segment as segment_utterances
 def collect_words_with_speaker_fallback(segments: list[dict]) -> list[dict]:
     """청크 단위 segments → (word, start, end, speaker) 플랫 리스트.
 
-    `speaker`가 비어 있으면 인접 단어에서 전파해 `SPEAKER_0`으로 폴백한다.
+    ``speaker``가 비어 있으면 인접 단어에서 전파해 ``SPEAKER_00``으로 폴백한다.
     """
     words: list[dict] = []
     for s in segments:
@@ -44,7 +44,8 @@ def collect_words_with_speaker_fallback(segments: list[dict]) -> list[dict]:
             elif i + 1 < len(words) and words[i + 1]["speaker"] is not None:
                 w["speaker"] = words[i + 1]["speaker"]
             else:
-                w["speaker"] = "SPEAKER_0"
+                # SPEAKER_NN 패턴 (자릿수 패딩) 유지 — 다른 코드 경로와 일관성
+                w["speaker"] = "SPEAKER_00"
     return words
 
 

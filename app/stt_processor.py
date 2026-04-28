@@ -18,7 +18,10 @@ from app.services.audio_preprocessor import load_df_model, preprocess
 from app.services.diarization_config import DiarizationConfig
 from app.services.recluster_config import ReclusterConfig
 from app.services.speaker_embedding import SpeakerEmbeddingModel
-from app.services.speaker_recluster import maybe_recluster_speakers
+from app.services.speaker_recluster import (
+    maybe_recluster_speakers,
+    renumber_speakers_in_place,
+)
 from app.services.utterance_segmenter import segment as segment_utterances
 from app.services.audio_pii_masker import find_pii_word_ranges, mask_audio_ranges
 from app.services.audio_splitter import (
@@ -738,7 +741,8 @@ def transcribe(
                         elif i + 1 < len(all_words) and all_words[i + 1]["speaker"] is not None:
                             w["speaker"] = all_words[i + 1]["speaker"]
                         else:
-                            w["speaker"] = "SPEAKER_0"
+                            # SPEAKER_NN 패턴 (자릿수 패딩) 유지 — 다른 코드 경로와 일관성
+                            w["speaker"] = "SPEAKER_00"
 
                 utterance_boundaries = segment_utterances(all_words, total_dur)
                 utterances_result = []
@@ -760,7 +764,7 @@ def transcribe(
 
             if split_by_speaker:
                 speaker_ids = sorted(set(
-                    s.get("speaker", "SPEAKER_0") for s in segments
+                    s.get("speaker", "SPEAKER_00") for s in segments
                     if s.get("speaker") is not None
                 ))
                 speaker_audio_result = []
@@ -777,17 +781,42 @@ def transcribe(
 
         elapsed = time.time() - start
 
+        # Bug 7 안전망: pyannote/recluster 결과의 speaker_id 갭(SPEAKER_03 누락 등)이나
+        # 비표준 형식("SPEAKER_0")을 0~N-1 연속 번호로 정규화.
+        # segments / utterances / speaker_audio 모두 일관되게 갱신.
+        renumber_speakers_in_place(
+            segments=segments,
+            utterances=utterances_result,
+            speaker_audio=speaker_audio_result,
+        )
+
         # 오디오 통계 계산
         file_size = file_path.stat().st_size if file_path.exists() else 0
         audio_stats = _compute_audio_stats(
             audio, config.SAMPLE_RATE, segments, total_duration, file_size,
         )
 
+        # ffprobe metadata가 손상된 컨테이너에서 잘못된 값을 반환하는 케이스를 방어한다.
+        # 실제 처리된 오디오 길이를 다음 우선순위로 결정:
+        #   1) audio 배열이 있으면 len(audio) / sample_rate (정확)
+        #   2) segments의 max(end) (Whisper 처리 범위)
+        #   3) ffprobe 메타데이터 (fallback)
+        max_segment_end = max(
+            (float(seg.get("end", 0.0)) for seg in segments),
+            default=0.0,
+        )
+        if audio is not None:
+            audio_duration = float(len(audio)) / float(config.SAMPLE_RATE)
+            actual_duration = max(audio_duration, max_segment_end)
+        else:
+            # 청크 모드: audio 배열이 None일 수 있으므로 segments + total_duration 중 큰 값 사용
+            actual_duration = max(max_segment_end, float(total_duration))
+
         output = {
             "task_id": task_id,
             "status": "completed",
             "language": config.LANGUAGE,
-            "duration_seconds": round(total_duration, 2),
+            "duration_seconds": round(actual_duration, 2),
             "processing_seconds": round(elapsed, 2),
             "segments": segments,
             "full_text": full_text,

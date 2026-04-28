@@ -241,7 +241,9 @@ def _apply_padding(utterances: list[_RawUtterance], total_duration: float) -> li
         result.append(UtteranceBoundary(
             start_sec=_round2(start),
             end_sec=_round2(end),
-            duration_sec=_round2(end - start),
+            # WAV 추출은 padded 구간으로 진행되므로 duration_sec도 padded 길이로 일치시킴.
+            # 이렇게 해야 metadata.duration_sec == 실제 WAV 길이.
+            duration_sec=_round2(padded_end - padded_start),
             padded_start_sec=_round2(padded_start),
             padded_end_sec=_round2(padded_end),
             speaker_id=u.speaker_id,
@@ -254,7 +256,8 @@ def _apply_padding(utterances: list[_RawUtterance], total_duration: float) -> li
 # -- Utilities --
 
 def _get_speaker_id(word: dict) -> str:
-    return str(word.get("speakerId", word.get("speaker", "SPEAKER_0")))
+    # SPEAKER_NN 패턴 (자릿수 패딩) 유지 — 다른 코드 경로와 일관성
+    return str(word.get("speakerId", word.get("speaker", "SPEAKER_00")))
 
 
 def _to_float(val) -> float:
