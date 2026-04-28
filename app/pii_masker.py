@@ -107,10 +107,17 @@ _SURNAME_PATTERN = re.compile(
 )
 
 # 호칭/직함 (이름 뒤에 올 수 있는 단어)
+# 2글자 이름(성+1글자)은 다음 호칭이 와야 PII로 판정.
+# 3글자 이름(성+2글자)은 호칭 무관 PII로 판정.
 _HONORIFICS = (
+    # 존칭 + 직함
     "씨", "님", "선생", "교수", "박사", "사장", "대표", "이사",
     "부장", "차장", "과장", "대리", "사원", "주임", "팀장", "실장",
     "원장", "국장", "처장", "위원", "총장", "학장", "선배", "후배",
+    # 일상 호칭 (실제 통화에서 매우 흔함 — 알파 샘플 "김용철 형" 케이스)
+    "형", "형님", "누나", "언니", "오빠", "동생",
+    "어머니", "아버지", "엄마", "아빠", "할머니", "할아버지",
+    "아주머니", "아저씨", "삼촌", "이모", "고모", "외삼촌",
 )
 
 # PII 패턴 정의 (순서 중요: 구체적인 패턴이 먼저)
@@ -318,10 +325,31 @@ def mask_pii(text: str, enable_name_masking: bool = False) -> dict:
 def mask_segments(
     segments: list[dict], enable_name_masking: bool = False
 ) -> list[dict]:
-    """세그먼트 리스트의 텍스트를 마스킹한다."""
-    total_pii = []
+    """세그먼트 리스트의 텍스트를 마스킹한다.
+
+    여러 세그먼트에서 같은 PII 유형이 감지되면 count를 합산하여
+    유형별 단일 항목으로 반환한다 (응답 스키마 PIIDetectedItem 계약).
+    이전에는 list.extend()로 중복 dict 항목이 누적되어 응답에서
+    유형이 중복되거나 일부 클라이언트에서 처리 시 마지막 값만 보였음.
+    """
+    type_count_map: dict[str, int] = {}
     for seg in segments:
         result = mask_pii(seg.get("text", ""), enable_name_masking)
         seg["text"] = result["masked_text"]
-        total_pii.extend(result["pii_detected"])
-    return total_pii
+        for item in result["pii_detected"]:
+            t = item["type"]
+            type_count_map[t] = type_count_map.get(t, 0) + int(item["count"])
+
+    # PII_PATTERNS 선언 순서 유지 (이름은 항상 마지막) — 응답 일관성
+    seen: set[str] = set()
+    pattern_order: list[str] = []
+    for _, _, label in PII_PATTERNS:
+        if label not in seen:
+            seen.add(label)
+            pattern_order.append(label)
+    pattern_order.append("이름")
+    return [
+        {"type": label, "count": type_count_map[label]}
+        for label in pattern_order
+        if label in type_count_map
+    ]

@@ -610,12 +610,15 @@ def transcribe(
             # ── 청크 모드: 대용량 오디오 ──
             # 발화 WAV는 청크 내부에서 바로 생성된다. 화자별 WAV는 전체 배열이 필요하므로
             # 청크 모드에서는 제공하지 않는다 (API 스펙에 명시).
+            # PII 이름 마스킹: 텍스트(enable_name_masking)와 음성(mask_audio_names)을 OR로
+            # 동기화. 사용자가 텍스트만 켜도 음성 PII도 자동 마스킹되어 정합성 유지.
+            audio_name_masking = mask_audio_names or enable_name_masking
             segments, chunked_utterances, chunked_audio_files, pii_audio_ranges = _transcribe_chunked(
                 file_path, task_id, total_duration, enable_diarize,
                 split_by_utterance=split_by_utterance,
                 diarization_options=diarization_options,
                 mask_audio_pii=mask_audio_pii,
-                mask_audio_names=mask_audio_names,
+                mask_audio_names=audio_name_masking,
             )
             audio = None
             diarize_active = enable_diarize and _diarize_model is not None
@@ -670,10 +673,12 @@ def transcribe(
             diarize_active = enable_diarize and _diarize_model is not None
 
             # 5. 음성 PII 마스킹 (일반 모드)
+            # PII 이름 마스킹: 텍스트와 음성을 OR로 동기화 (chunked 모드와 동일 정책).
+            audio_name_masking = mask_audio_names or enable_name_masking
             if mask_audio_pii:
                 pii_audio_ranges = find_pii_word_ranges(
                     segments,
-                    enable_name_masking=mask_audio_names,
+                    enable_name_masking=audio_name_masking,
                     pad_sec=config.PII_MASK_PAD_SEC,
                 )
                 if pii_audio_ranges:
