@@ -230,6 +230,36 @@ class UtteranceResult(BaseModel):
     )
 
 
+class SpeakerInfo(BaseModel):
+    """STAGE 15: 화자 분석 결과.
+
+    WeSpeaker 임베딩 매칭(profile_match) 또는 발화 시간 기반(heuristic)으로
+    발화자/상대방을 식별하고, 성별·연령·관계를 분석합니다.
+    """
+
+    speaker_label: str = Field(..., description="화자 레이블 (SPEAKER_00, ...)", examples=["SPEAKER_00"])
+    speaker_role: Optional[str] = Field(None, description="'self'(발화자) | 'other'(상대방)", examples=["self"])
+    speaker_role_source: Optional[str] = Field(None, description="'profile_match' | 'heuristic'", examples=["profile_match"])
+    speaker_gender: Optional[str] = Field(None, description="'male' | 'female' | null(미상)", examples=["male"])
+    speaker_voice_age_range: Optional[str] = Field(None, description="목소리 연령대 (20대|30대|40대|50대+|null)", examples=["30대"])
+    speaker_speech_age_range: Optional[str] = Field(None, description="말투 연령대 (20대|30대|40대|50대+|null)", examples=["30대"])
+    speaker_speech_age_model_version: Optional[str] = Field(None, description="말투 연령 예측 모델 버전", examples=["v20250513_120000"])
+    speaker_relation: Optional[str] = Field(None, description="관계 ('부모'|'배우자'|'친구'|'직장상사'|'교사'|'형제자매'|null)", examples=["부모"])
+
+
+class TopicSegmentInfo(BaseModel):
+    """STAGE 16: 주제 세그먼트 정보.
+
+    KcELECTRA 임베딩 cosine 유사도 기반 경계 탐지 + 고정 주제 분류.
+    """
+
+    segment_index: int = Field(..., description="세그먼트 인덱스 (0-based)", examples=[0])
+    topic: Optional[str] = Field(None, description="주제 레이블 (30개 분류 중 하나)", examples=["건강/의료"])
+    start_ms: int = Field(..., description="세그먼트 시작 시간 (밀리초)", examples=[0])
+    end_ms: int = Field(..., description="세그먼트 종료 시간 (밀리초)", examples=[45000])
+    utterance_indices: list[int] = Field(default_factory=list, description="이 세그먼트에 속하는 utterance index 목록")
+
+
 class SpeakerAudioResult(BaseModel):
     """화자별 오디오 결과.
 
@@ -319,6 +349,21 @@ class TranscribeResultResponse(BaseModel):
         None,
         description="화자별 mute 오디오 목록. `diarize=true` + `split_by_speaker=true`일 때만 포함. "
         "원본 타임라인 유지, 상대방 구간은 무음 처리",
+    )
+    speakers: Optional[list[SpeakerInfo]] = Field(
+        None,
+        description="STAGE 15 화자 분석 결과 목록. `diarize=true`일 때 포함. "
+        "발화자 식별(self/other), 성별, 연령, 관계 분석값 포함.",
+    )
+    topic_segments: Optional[list[TopicSegmentInfo]] = Field(
+        None,
+        description="STAGE 16 주제 세그먼트 목록. `diarize=true` + `split_by_utterance=true`일 때 포함. "
+        "KcELECTRA 임베딩 기반 경계 탐지 후 고정 30개 주제 분류.",
+    )
+    schema_version: int = Field(
+        2,
+        description="응답 스키마 버전 (2=speakers+topic_segments 포함)",
+        examples=[2],
     )
 
     model_config = {

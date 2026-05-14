@@ -121,6 +121,42 @@ class AutoLabelService:
 
         return results
 
+    def encode(self, texts: list[str]):
+        """[CLS] 임베딩을 numpy 배열 (N, hidden) 로 반환한다.
+
+        모델이 없으면 None 반환.
+        """
+        if not self.is_available():
+            return None
+        import numpy as np
+        import torch
+
+        all_vecs: list[np.ndarray] = []
+        for batch_start in range(0, len(texts), BATCH_SIZE):
+            batch = texts[batch_start : batch_start + BATCH_SIZE]
+            try:
+                encoded = self._tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=MAX_LEN,
+                    return_tensors="pt",
+                )
+                with torch.no_grad():
+                    out = self._encoder(
+                        input_ids=encoded["input_ids"],
+                        attention_mask=encoded["attention_mask"],
+                        token_type_ids=encoded.get("token_type_ids"),
+                    )
+                    cls = out.last_hidden_state[:, 0].cpu().numpy()
+                all_vecs.append(cls)
+            except Exception as exc:
+                logger.error("AutoLabelService.encode 배치 오류: %s", exc)
+                hidden = self._encoder.config.hidden_size
+                all_vecs.append(np.zeros((len(batch), hidden), dtype=np.float32))
+
+        return np.concatenate(all_vecs, axis=0) if all_vecs else None
+
     # ------------------------------------------------------------------
     def _try_load(self) -> None:
         self._load_attempted = True
