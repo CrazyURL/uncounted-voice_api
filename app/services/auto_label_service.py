@@ -186,3 +186,7 @@ def _null_result(version: str = "") -> LabelResult:
         dialog_act_confidence=0.0,
         model_version=version,
     )
+
+
+# 모듈 레벨 싱글톤 — main.py lifespan에서 초기화, stt_processor에서 import
+auto_label_service = AutoLabelService()
