@@ -119,11 +119,26 @@ async def pick_next_session() -> Optional[dict]:
 # ── S3 audio download ─────────────────────────────────────────────────
 
 async def download_raw_audio(raw_audio_url: str) -> str:
-    """Stream S3 object to a temp file on disk (never in RAM). Returns path — caller deletes."""
-    ext = raw_audio_url.rsplit(".", 1)[-1].lower() if "." in raw_audio_url else "wav"
+    """Stream audio to a temp file on disk (never in RAM). Returns path — caller deletes.
+
+    Handles two formats:
+    - Full HTTP/HTTPS URL (old sessions: Supabase storage URL or presigned URL)
+    - Bare S3 key (new sessions: object key relative to S3_AUDIO_BUCKET)
+    """
+    # Strip query string before extracting extension (presigned URLs: ?X-Amz-...)
+    path_part = raw_audio_url.split("?")[0]
+    ext = path_part.rsplit(".", 1)[-1].lower() if "." in path_part else "wav"
     tmp = tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False)
     try:
-        await _run(lambda: _s3.download_fileobj(S3_AUDIO_BUCKET, raw_audio_url, tmp))
+        if raw_audio_url.startswith(("http://", "https://")):
+            # Legacy sessions store a full URL — download via HTTP
+            async with _http.get(raw_audio_url) as resp:
+                resp.raise_for_status()
+                async for chunk in resp.content.iter_chunked(1024 * 1024):
+                    tmp.write(chunk)
+        else:
+            # New sessions store a bare S3 key
+            await _run(lambda: _s3.download_fileobj(S3_AUDIO_BUCKET, raw_audio_url, tmp))
         tmp.flush()
         return tmp.name
     finally:
