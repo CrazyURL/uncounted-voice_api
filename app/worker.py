@@ -90,7 +90,7 @@ async def pick_next_session() -> Optional[dict]:
         lambda: _supabase.table("sessions").select("*")
         .eq("gpu_upload_status", "pending")
         .filter("raw_audio_url", "not.is", "null")
-        .order("created_at")
+        .order("updated_at")
         .limit(5)
         .execute()
     )
@@ -280,6 +280,32 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
     utterances = job_result.get("utterances", [])
     loop = asyncio.get_running_loop()
 
+    # ── STAGE 15: session_speakers ────────────────────────────────────────
+    speaker_label_to_id: dict[str, str] = {}
+    speakers_data = job_result.get("speakers", [])
+    for spk in speakers_data:
+        spk_row = {
+            "session_id": session_id,
+            "speaker_label": spk["speaker_label"],
+            "speaker_role": spk.get("speaker_role"),
+            "speaker_role_source": spk.get("speaker_role_source"),
+            "speaker_gender": spk.get("speaker_gender"),
+            "speaker_voice_age_range": spk.get("speaker_voice_age_range"),
+            "speaker_speech_age_range": spk.get("speaker_speech_age_range"),
+            "speaker_speech_age_model_version": spk.get("speaker_speech_age_model_version"),
+            "speaker_relation": spk.get("speaker_relation"),
+        }
+        try:
+            result = await _run(
+                lambda r=spk_row: _supabase.table("session_speakers")
+                .upsert(r, on_conflict="session_id,speaker_label")
+                .execute()
+            )
+            if result.data:
+                speaker_label_to_id[spk["speaker_label"]] = result.data[0]["id"]
+        except Exception as e:
+            log.warning("[%s] session_speakers upsert failed (%s): %s", session_id, spk["speaker_label"], e)
+
     upserted = 0
     for i, utt in enumerate(utterances):
         seq: int = i + 1
@@ -319,6 +345,7 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
         duration_sec = round(
             float(utt.get("end_sec") or 0) - float(utt.get("start_sec") or 0), 3
         )
+        speaker_label: str | None = utt.get("speaker_id")
         row = {
             "id": utt_id,
             "session_id": session_id,
@@ -326,7 +353,8 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "user_id": user_id,
             "sequence_in_chunk": seq,
             "sequence_order": seq,
-            "speaker_id": utt.get("speaker_id"),
+            "speaker_id": speaker_label,
+            "session_speaker_id": speaker_label_to_id.get(speaker_label) if speaker_label else None,
             "is_user": False,
             "start_sec": utt.get("start_sec"),
             "end_sec": utt.get("end_sec"),
@@ -348,6 +376,46 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             .execute()
         )
         upserted += 1
+
+    # ── STAGE 16: session_segments ────────────────────────────────────────
+    topic_segments_data = job_result.get("topic_segments", [])
+    segment_index_to_id: dict[int, str] = {}
+    for seg in topic_segments_data:
+        seg_row = {
+            "session_id": session_id,
+            "segment_index": seg["segment_index"],
+            "topic": seg.get("topic"),
+            "start_ms": seg.get("start_ms"),
+            "end_ms": seg.get("end_ms"),
+            "utterance_count": len(seg.get("utterance_indices", [])),
+        }
+        try:
+            result = await _run(
+                lambda r=seg_row: _supabase.table("session_segments")
+                .upsert(r, on_conflict="session_id,segment_index")
+                .execute()
+            )
+            if result.data:
+                segment_index_to_id[seg["segment_index"]] = result.data[0]["id"]
+        except Exception as e:
+            log.warning("[%s] session_segments upsert failed (%d): %s", session_id, seg["segment_index"], e)
+
+    for seg in topic_segments_data:
+        seg_id = segment_index_to_id.get(seg["segment_index"])
+        if not seg_id:
+            continue
+        for utt_idx in seg.get("utterance_indices", []):
+            utt_seq = utt_idx + 1
+            utt_seg_id = f"utt_{session_id}_{str(utt_seq).zfill(3)}"
+            try:
+                await _run(
+                    lambda uid=utt_seg_id, sid=seg_id: _supabase.table("utterances")
+                    .update({"segment_id": sid})
+                    .eq("id", uid)
+                    .execute()
+                )
+            except Exception as e:
+                log.warning("[%s] utterances.segment_id update failed (%s): %s", session_id, utt_seg_id, e)
 
     # Overwrite raw_audio_url with preprocessed audio (best-effort, skip on error)
     preproc_tmp = None
