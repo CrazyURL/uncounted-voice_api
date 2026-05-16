@@ -153,6 +153,7 @@ async def submit_to_voice_api(audio_path: str) -> str:
         "language": "ko",
         "diarize": "true",
         "split_by_utterance": "true",
+        "split_by_speaker": "true",
         "mask_pii": "true",
         "denoise": "true",
     }
@@ -517,6 +518,84 @@ async def sweep_stuck_sessions() -> None:
     except Exception as e:
         log.error("sweep_stuck_sessions error: %s", e)
 
+    # Feature 1: both_agreed + raw_audio_url IS NULL 영구 stall 경보
+    try:
+        null_audio_res = await _run(
+            lambda: _supabase.table("sessions").select("id", count="exact")
+            .eq("consent_status", "both_agreed")
+            .is_("raw_audio_url", "null")
+            .neq("gpu_upload_status", "done")
+            .neq("gpu_upload_status", "skipped")
+            .execute()
+        )
+        null_count = null_audio_res.count or 0
+        if null_count > 5:
+            log.warning(
+                "sweep: %d sessions both_agreed + raw_audio_url IS NULL (영구 stall 의심) — 수동 조치 필요",
+                null_count,
+            )
+    except Exception as e:
+        log.error("sweep null_audio_url check error: %s", e)
+
+
+async def sweep_segment_backfill() -> None:
+    """Feature 2: quality_status=done 인데 segment_id=NULL 발화를 시간 범위로 역할당."""
+    try:
+        orphan_res = await _run(
+            lambda: _supabase.table("utterances")
+            .select("id, session_id, start_sec")
+            .is_("segment_id", "null")
+            .limit(200)
+            .execute()
+        )
+        orphans = orphan_res.data or []
+        if not orphans:
+            return
+
+        sessions_to_fix: dict[str, list[dict]] = {}
+        for utt in orphans:
+            sessions_to_fix.setdefault(utt["session_id"], []).append(utt)
+
+        patched = 0
+        for session_id, utts in sessions_to_fix.items():
+            seg_res = await _run(
+                lambda s=session_id: _supabase.table("session_segments")
+                .select("id, start_ms, end_ms")
+                .eq("session_id", s)
+                .order("start_ms")
+                .execute()
+            )
+            segments = seg_res.data or []
+            if not segments:
+                continue
+
+            for utt in utts:
+                utt_ms = (utt.get("start_sec") or 0) * 1000
+                matched_seg_id = None
+                for seg in segments:
+                    if seg["start_ms"] <= utt_ms <= seg["end_ms"]:
+                        matched_seg_id = seg["id"]
+                        break
+                if not matched_seg_id:
+                    nearest = min(segments, key=lambda s: abs(s["start_ms"] - utt_ms))
+                    matched_seg_id = nearest["id"]
+                try:
+                    await _run(
+                        lambda uid=utt["id"], sid=matched_seg_id: _supabase.table("utterances")
+                        .update({"segment_id": sid})
+                        .eq("id", uid)
+                        .execute()
+                    )
+                    patched += 1
+                except Exception as e:
+                    log.warning("[%s] backfill segment_id failed for %s: %s", session_id, utt["id"], e)
+
+        if patched:
+            log.info("sweep_segment_backfill: %d orphan utterances patched in %d sessions",
+                     patched, len(sessions_to_fix))
+    except Exception as e:
+        log.error("sweep_segment_backfill error: %s", e)
+
 
 # ── Session processing ────────────────────────────────────────────────
 
@@ -545,6 +624,34 @@ async def process_one_session() -> str:
 
         utterance_count = await persist_results(session, task_id, job_result)
         log.info("[%s] persisted %d utterances", session_id, utterance_count)
+
+        # Feature 3: both_agreed + 화자 1명 + 발화 6개 이상 → 재처리 큐
+        if (
+            session.get("consent_status") == "both_agreed"
+            and utterance_count >= 6
+            and not (session.get("gpu_last_error") or "").startswith("SPEAKER_REQUEUE:")
+        ):
+            sp_res = await _run(
+                lambda: _supabase.table("session_speakers")
+                .select("id", count="exact")
+                .eq("session_id", session_id)
+                .execute()
+            )
+            if (sp_res.count or 0) == 1:
+                log.warning(
+                    "[%s] both_agreed + 화자 1명 + %d 발화 — pyannote 실패 의심, 재처리 큐 진입",
+                    session_id, utterance_count,
+                )
+                await _run(
+                    lambda: _supabase.table("sessions").update({
+                        "gpu_upload_status": "pending",
+                        "gpu_started_at": None,
+                        "gpu_retry_count": 0,
+                        "gpu_last_error": f"SPEAKER_REQUEUE: both_agreed+1speaker+{utterance_count}utts",
+                        "updated_at": _now_iso(),
+                    }).eq("id", session_id).execute()
+                )
+                return "done"
 
         now = _now_iso()
         auto_label_status = "done" if utterance_count > 0 else "skipped"
@@ -611,6 +718,7 @@ async def sweep_loop() -> None:
     while not is_shutting_down:
         await asyncio.sleep(STUCK_SWEEP_INTERVAL_SEC)
         await sweep_stuck_sessions()
+        await sweep_segment_backfill()
 
 
 # ── Entry point ───────────────────────────────────────────────────────
