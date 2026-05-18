@@ -268,7 +268,7 @@ def _get_audio_stats_sync(wav_path: str) -> dict:
 
 
 def _compute_quality(rms_db: float, peak_db: float, silence_ratio: float) -> tuple:
-    """Port of qualityMetricsService.ts computeQualityScore. Returns (score, grade)."""
+    """Port of qualityMetricsService.ts computeQualityScore. Returns (score, grade, snr_db, speech_ratio)."""
     snr_db = abs(peak_db - rms_db)
     speech_ratio = max(0.0, 1.0 - silence_ratio)
     clipping_ratio = min(1.0, (peak_db + 1) / 1.0) if peak_db > -1 else 0.0
@@ -279,7 +279,7 @@ def _compute_quality(rms_db: float, peak_db: float, silence_ratio: float) -> tup
         snr_score * 0.4 + speech_score * 0.4 + 20 - clipping_penalty
     )))
     grade = "A" if score >= 80 else "B" if score >= 50 else "C"
-    return score, grade
+    return score, grade, snr_db, speech_ratio
 
 
 # ── Persist results ───────────────────────────────────────────────────
@@ -322,6 +322,8 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
         except Exception as e:
             log.warning("[%s] session_speakers upsert failed (%s): %s", session_id, spk["speaker_label"], e)
 
+    pii_summary = job_result.get("pii_summary", [])
+
     upserted = 0
     for i, utt in enumerate(utterances):
         seq: int = i + 1
@@ -331,6 +333,8 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
 
         quality_score = None
         quality_grade = None
+        snr_db = None
+        speech_ratio = None
         file_size_bytes = None
         tmp_path = None
 
@@ -342,7 +346,7 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             file_size_bytes = os.path.getsize(tmp_path)
 
             stats = await loop.run_in_executor(None, _get_audio_stats_sync, tmp_path)
-            quality_score, quality_grade = _compute_quality(
+            quality_score, quality_grade, snr_db, speech_ratio = _compute_quality(
                 stats["rms_db"], stats["peak_db"], stats["silence_ratio"]
             )
 
@@ -361,6 +365,19 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
         duration_sec = round(
             float(utt.get("end_sec") or 0) - float(utt.get("start_sec") or 0), 3
         )
+        utt_start = float(utt.get("start_sec") or 0)
+        utt_end = float(utt.get("end_sec") or 0)
+        pii_intervals = []
+        for pii_item in pii_summary:
+            for tr in pii_item.get("time_ranges", []):
+                if tr["start"] < utt_end and tr["end"] > utt_start:
+                    pii_intervals.append({
+                        "startSec": round(tr["start"], 2),
+                        "endSec": round(tr["end"], 2),
+                        "maskType": "audio",
+                        "piiType": pii_item["type"],
+                    })
+
         speaker_label: str | None = utt.get("speaker_id")
         row = {
             "id": utt_id,
@@ -384,6 +401,9 @@ async def persist_results(session: dict, task_id: str, job_result: dict) -> int:
             "client_version": "gpu-worker-2.0",
             "quality_score": quality_score,
             "quality_grade": quality_grade,
+            "snr_db": snr_db,
+            "speech_ratio": speech_ratio,
+            "pii_intervals": pii_intervals,
             # Stage 14: 자동 라벨
             "emotion": utt.get("emotion"),
             "emotion_confidence": utt.get("emotion_confidence"),

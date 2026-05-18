@@ -111,6 +111,7 @@ datasets>=2.18
 scikit-learn==1.8.0
 sentencepiece>=0.2.0
 scipy==1.17.1
+librosa>=0.10.0
 setuptools==70.2.0
 six==1.17.0
 sortedcontainers==2.4.0
